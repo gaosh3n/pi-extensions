@@ -1,0 +1,58 @@
+{
+    "name": "pi-extensions",
+    "version": "0.1.0",
+    "description": "Extensions for Pi, a minimal agent harness",
+    "type": "module",
+    "packageManager": "pnpm@11.23.0",
+    "keywords": [
+        "pi-package",
+        "pi",
+        "extensions"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/gaosh3n/pi-extensions.git"
+    },
+    "scripts": {
+        "lint": "oxlint .",
+        "lint:fix": "oxlint . --fix",
+        "format:write": "oxfmt . --write",
+        "format:check": "oxfmt . --check"
+    },
+    "pi": {
+        "extensions": [
+            "./extensions"
+        ],
+        "skills": [
+            "./skills"
+        ],
+        "prompts": [
+            "./prompts"
+        ],
+        "themes": [
+            "./themes"
+        ]
+    },
+    "peerDependencies": {
+        "@earendil-works/pi-agent-core": "*",
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-telemetry": "*",
+        "@earendil-works/pi-tui": "*"
+    },
+    "devDependencies": {
+        "@earendil-works/pi-agent-core": "0.84.3",
+        "@earendil-works/pi-ai": "0.84.3",
+        "@earendil-works/pi-coding-agent": "0.84.3",
+        "@earendil-works/pi-telemetry": "0.84.3",
+        "@earendil-works/pi-tui": "0.84.3",
+        "@types/node": "22.19.19",
+        "oxfmt": "0.65.0",
+        "oxlint": "1.80.0",
+        "typescript": "5.9.3"
+    },
+    "engines": {
+        "node": ">=22.19.0"
+    }
+}
