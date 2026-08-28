@@ -1,0 +1,24 @@
+{
+    "$schema": "./node_modules/oxlint/configuration_schema.json",
+    "plugins": ["import", "typescript"],
+    "env": {
+        "node": true,
+        "es2024": true
+    },
+    "ignorePatterns": ["node_modules/", "dist/", "coverage/"],
+    "categories": {
+        "correctness": "error",
+        "suspicious": "error"
+    },
+    "rules": {
+        "import/first": "error",
+        "import/no-duplicates": "error",
+        "typescript/consistent-type-imports": [
+            "error",
+            {
+                "fixStyle": "separate-type-imports",
+                "prefer": "type-imports"
+            }
+        ]
+    }
+}
