@@ -22,7 +22,7 @@
     },
     "pi": {
         "extensions": [
-            "./extensions"
+            "./packages/*/index.ts"
         ],
         "skills": [
             "./skills"
