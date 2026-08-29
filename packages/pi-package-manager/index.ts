@@ -1,6 +1,7 @@
 import {
     DefaultPackageManager,
     getAgentDir,
+    keyText,
     SettingsManager,
     type CustomEntry,
     type ExecResult,
@@ -25,6 +26,7 @@ export type AutoUpdateOutcome = "succeeded" | "failed" | "skipped"
 export type ReportTone = "info" | "success" | "warning" | "error"
 
 type WidgetState =
+    | { mode: "status-checking" }
     | { mode: "checking" }
     | { mode: "installing"; packages: number }
     | { mode: "countdown"; secondsRemaining: number }
@@ -39,9 +41,14 @@ export interface AutoUpdateRecord {
 
 export interface PackageManagerReport {
     title: string
+    headline?: string
     tone: ReportTone
     lines: string[]
+    lineTone?: "default" | "dim"
     output?: string
+    outputLabel?: string
+    outputTone?: "default" | "dim"
+    hideOutputWhenCollapsed?: boolean
 }
 
 export interface PackageStatusSnapshot {
@@ -69,6 +76,8 @@ export default function (pi: ExtensionAPI) {
                       : report.tone === "success"
                         ? "success"
                         : "accent"
+            const lineTextTone = report.lineTone === "dim" ? "dim" : "customMessageText"
+            const outputTextTone = report.outputTone === "dim" ? "dim" : lineTextTone
 
             const box = new Box(1, 1, (text: string) =>
                 theme.bg("customMessageBg", text),
@@ -82,11 +91,15 @@ export default function (pi: ExtensionAPI) {
                 ),
             )
 
+            if (report.headline) {
+                box.addChild(new Text(theme.fg("text", report.headline), 0, 0))
+            }
+
             if (report.lines.length > 0) {
                 box.addChild(
                     new Text(
                         report.lines
-                            .map((line) => theme.fg("customMessageText", line))
+                            .map((line) => theme.fg(lineTextTone, line))
                             .join("\n"),
                         0,
                         0,
@@ -95,22 +108,44 @@ export default function (pi: ExtensionAPI) {
             }
 
             if (report.output?.trim()) {
-                const { text, truncated } = formatReportOutput(report.output, expanded)
+                if (!expanded && report.hideOutputWhenCollapsed) {
+                    box.addChild(
+                        new Text(
+                            formatExpandHint(theme, "to expand to see update output."),
+                            0,
+                            0,
+                        ),
+                    )
+                } else {
+                    const { text, truncated } = formatReportOutput(
+                        report.output,
+                        expanded,
+                    )
 
-                box.addChild(new Text(theme.fg("dim", "Update output:"), 0, 0))
-                box.addChild(new Text(theme.fg("toolOutput", text), 0, 0))
-
-                if (truncated) {
                     box.addChild(
                         new Text(
                             theme.fg(
-                                "dim",
-                                "Expand this entry to view the full update output.",
+                                outputTextTone,
+                                report.outputLabel ?? "Update output:",
                             ),
                             0,
                             0,
                         ),
                     )
+                    box.addChild(new Text(theme.fg(outputTextTone, text), 0, 0))
+
+                    if (truncated) {
+                        box.addChild(
+                            new Text(
+                                formatExpandHint(
+                                    theme,
+                                    "to expand to view the full update output.",
+                                ),
+                                0,
+                                0,
+                            ),
+                        )
+                    }
                 }
             }
 
@@ -154,13 +189,11 @@ export default function (pi: ExtensionAPI) {
             }
 
             if (subcommand === "update") {
-                const automatic = tokens.includes("--startup")
-                const result = await runUpdate(pi, ctx, { automatic })
+                const result = await runUpdate(pi, ctx, {
+                    startupTriggered: tokens.includes("--startup"),
+                })
 
-                if (automatic && result.autoUpdateRecord) {
-                    lastAutoUpdateRecord = result.autoUpdateRecord
-                }
-
+                lastAutoUpdateRecord = result.autoUpdateRecord
                 return
             }
 
@@ -196,35 +229,19 @@ export function formatUtcTimestamp(isoUtc: string): string {
 }
 
 export function formatStatusLines(snapshot: PackageStatusSnapshot): string[] {
+    if (!snapshot.lastAutoUpdate) {
+        return ["Latest package update: none recorded."]
+    }
+
     const lines = [
-        "Status",
-        "",
-        `Available package updates: ${snapshot.availableUpdates.length}`,
-        "Packages:",
+        `Latest update start: ${formatUtcTimestamp(snapshot.lastAutoUpdate.startedAtUtc)}`,
+        `Latest update end: ${formatUtcTimestamp(snapshot.lastAutoUpdate.endedAtUtc)}`,
+        `Latest update result: ${snapshot.lastAutoUpdate.outcome}`,
+        `Latest update packages updated: ${snapshot.lastAutoUpdate.packagesUpdated}`,
     ]
 
-    if (snapshot.availableUpdates.length > 0) {
-        for (const packageName of snapshot.availableUpdates) {
-            lines.push(`- ${packageName}`)
-        }
-    } else {
-        lines.push("- none")
-    }
-
-    lines.push("", "Latest auto-update:")
-
-    if (!snapshot.lastAutoUpdate) {
-        lines.push("- none recorded")
-        return lines
-    }
-
-    lines.push(`- start: ${formatUtcTimestamp(snapshot.lastAutoUpdate.startedAtUtc)}`)
-    lines.push(`- end: ${formatUtcTimestamp(snapshot.lastAutoUpdate.endedAtUtc)}`)
-    lines.push(`- result: ${snapshot.lastAutoUpdate.outcome}`)
-    lines.push(`- packages updated: ${snapshot.lastAutoUpdate.packagesUpdated}`)
-
     if (snapshot.lastAutoUpdate.reason) {
-        lines.push(`- detail: ${snapshot.lastAutoUpdate.reason}`)
+        lines.push(`Latest update detail: ${snapshot.lastAutoUpdate.reason}`)
     }
 
     return lines
@@ -235,53 +252,20 @@ export function createStatusReport(
 ): PackageManagerReport {
     return {
         title: PACKAGE_MANAGER_TITLE,
+        headline:
+            snapshot.availableUpdates.length === 0
+                ? "No package updates are available."
+                : `${snapshot.availableUpdates.length} package update${snapshot.availableUpdates.length === 1 ? " is" : "s are"} available.`,
         tone: snapshot.availableUpdates.length > 0 ? "warning" : "info",
         lines: formatStatusLines(snapshot),
-    }
-}
-
-export function createManualUpdateStartReport(): PackageManagerReport {
-    return {
-        title: PACKAGE_MANAGER_TITLE,
-        tone: "info",
-        lines: ["Manual update in progress.", "Checking for package updates..."],
-    }
-}
-
-export function createManualUpdateReport(input: {
-    outcome: AutoUpdateOutcome
-    packagesUpdated: number
-    reason?: string
-    output?: string
-}): PackageManagerReport {
-    const lines = [
-        input.outcome === "failed"
-            ? "Manual update failed."
-            : input.outcome === "succeeded"
-              ? "Manual update completed."
-              : "Manual update skipped.",
-        `Result: ${input.outcome}`,
-        `Packages updated: ${input.packagesUpdated}`,
-    ]
-
-    if (input.reason) {
-        lines.push(`Detail: ${input.reason}`)
-    }
-
-    if (input.outcome === "succeeded" && input.packagesUpdated > 0) {
-        lines.push("Reloading now to activate updated package resources.")
-    }
-
-    return {
-        title: PACKAGE_MANAGER_TITLE,
-        tone:
-            input.outcome === "failed"
-                ? "error"
-                : input.outcome === "succeeded"
-                  ? "success"
-                  : "info",
-        lines,
-        output: input.output,
+        lineTone: "dim",
+        output:
+            snapshot.availableUpdates.length > 0
+                ? snapshot.availableUpdates.map((name) => `- ${name}`).join("\n")
+                : undefined,
+        outputLabel:
+            snapshot.availableUpdates.length > 0 ? "Available updates:" : undefined,
+        outputTone: "dim",
     }
 }
 
@@ -291,20 +275,11 @@ export function createAutoUpdateResultReport(input: {
     reloadAfterSeconds?: number
 }): PackageManagerReport {
     const lines = [
-        input.record.outcome === "failed"
-            ? "Pi package(s) update failed."
-            : input.record.outcome === "succeeded"
-              ? "Pi package(s) update completed."
-              : "Pi package(s) update skipped.",
         `Start: ${formatUtcTimestamp(input.record.startedAtUtc)}`,
         `End: ${formatUtcTimestamp(input.record.endedAtUtc)}`,
         `Result: ${input.record.outcome}`,
         `Packages updated: ${input.record.packagesUpdated}`,
     ]
-
-    if (input.record.reason) {
-        lines.push(`Detail: ${input.record.reason}`)
-    }
 
     if (input.reloadAfterSeconds) {
         lines.push(
@@ -314,6 +289,7 @@ export function createAutoUpdateResultReport(input: {
 
     return {
         title: PACKAGE_MANAGER_TITLE,
+        headline: formatAutomaticUpdateHeadline(input.record.outcome),
         tone:
             input.record.outcome === "failed"
                 ? "error"
@@ -321,26 +297,49 @@ export function createAutoUpdateResultReport(input: {
                   ? "success"
                   : "info",
         lines,
-        output: input.output,
+        lineTone: "dim",
+        output: input.output ?? input.record.reason,
+        outputTone: "dim",
+        hideOutputWhenCollapsed: true,
     }
 }
 
 export function createAutomaticUpdateWidgetLines(state: WidgetState): string[] {
+    if (state.mode === "status-checking") {
+        return ["Pi package status in progress.", "Checking for package updates..."]
+    }
+
     if (state.mode === "checking") {
-        return ["Pi package(s) update in progress.", "Checking for package updates..."]
+        return [
+            formatAutomaticUpdateHeadline("in-progress"),
+            "Checking for package updates...",
+        ]
     }
 
     if (state.mode === "installing") {
         return [
-            "Pi package(s) update in progress.",
+            formatAutomaticUpdateHeadline("in-progress"),
             `Installing ${state.packages} package update${state.packages === 1 ? "" : "s"}...`,
         ]
     }
 
     return [
-        "Pi package(s) update completed.",
+        formatAutomaticUpdateHeadline("succeeded"),
         `Reloading in ${state.secondsRemaining} second${state.secondsRemaining === 1 ? "" : "s"} to activate updated package resources.`,
     ]
+}
+
+function formatAutomaticUpdateHeadline(
+    state: AutoUpdateOutcome | "in-progress",
+): string {
+    const suffix =
+        state === "in-progress"
+            ? "in progress"
+            : state === "succeeded"
+              ? "completed"
+              : state
+
+    return `Pi package(s) update ${suffix}.`
 }
 
 export function getLastAutoUpdateRecord(
@@ -364,6 +363,8 @@ async function handleStatusCommand(
     ctx: ExtensionCommandContext,
     lastAutoUpdateRecord: AutoUpdateRecord | undefined,
 ): Promise<void> {
+    setPackageManagerWidget(ctx, { mode: "status-checking" })
+
     try {
         const availableUpdates = await checkForAvailableUpdates(ctx)
         pi.appendEntry(
@@ -374,40 +375,33 @@ async function handleStatusCommand(
             }),
         )
     } catch (error) {
-        const lines = [
-            "Status check failed.",
-            `Detail: Failed to check package updates: ${getErrorMessage(error)}`,
-        ]
-
-        if (lastAutoUpdateRecord) {
-            lines.push(
-                "",
-                `Latest auto-update result: ${lastAutoUpdateRecord.outcome}`,
-                `Latest auto-update detail: ${lastAutoUpdateRecord.reason ?? "none"}`,
-            )
-        }
-
         pi.appendEntry(REPORT_ENTRY_TYPE, {
             title: PACKAGE_MANAGER_TITLE,
+            headline: "Package status check failed.",
             tone: "error",
-            lines,
+            lines: formatStatusLines({
+                availableUpdates: [],
+                lastAutoUpdate: lastAutoUpdateRecord,
+            }),
+            lineTone: "dim",
+            output: `Failed to check package updates: ${getErrorMessage(error)}`,
+            outputLabel: "Error detail:",
+            outputTone: "dim",
         })
+    } finally {
+        clearPackageManagerWidget(ctx)
     }
 }
 
 async function runUpdate(
     pi: ExtensionAPI,
     ctx: ExtensionCommandContext,
-    options: { automatic: boolean },
-): Promise<{ autoUpdateRecord?: AutoUpdateRecord }> {
+    options: { startupTriggered: boolean },
+): Promise<{ autoUpdateRecord: AutoUpdateRecord }> {
     const startedAtUtc = new Date().toISOString()
-    let shouldClearAutomaticWidget = options.automatic
+    let shouldClearWidget = true
 
-    if (options.automatic) {
-        setPackageManagerWidget(ctx, { mode: "checking" })
-    } else {
-        pi.appendEntry(REPORT_ENTRY_TYPE, createManualUpdateStartReport())
-    }
+    setPackageManagerWidget(ctx, { mode: "checking" })
 
     try {
         if (process.env.PI_OFFLINE) {
@@ -419,17 +413,9 @@ async function runUpdate(
                 reason: "PI_OFFLINE is set.",
             })
 
-            if (options.automatic) {
-                pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
-                pi.appendEntry(
-                    REPORT_ENTRY_TYPE,
-                    createAutoUpdateResultReport({ record }),
-                )
-                return { autoUpdateRecord: record }
-            }
-
-            pi.appendEntry(REPORT_ENTRY_TYPE, createManualUpdateReport(record))
-            return {}
+            pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
+            pi.appendEntry(REPORT_ENTRY_TYPE, createAutoUpdateResultReport({ record }))
+            return { autoUpdateRecord: record }
         }
 
         const availableUpdates = await checkForAvailableUpdates(ctx)
@@ -443,25 +429,15 @@ async function runUpdate(
                 reason: "No package updates are available.",
             })
 
-            if (options.automatic) {
-                pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
-                pi.appendEntry(
-                    REPORT_ENTRY_TYPE,
-                    createAutoUpdateResultReport({ record }),
-                )
-                return { autoUpdateRecord: record }
-            }
-
-            pi.appendEntry(REPORT_ENTRY_TYPE, createManualUpdateReport(record))
-            return {}
+            pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
+            pi.appendEntry(REPORT_ENTRY_TYPE, createAutoUpdateResultReport({ record }))
+            return { autoUpdateRecord: record }
         }
 
-        if (options.automatic) {
-            setPackageManagerWidget(ctx, {
-                mode: "installing",
-                packages: availableUpdates.length,
-            })
-        }
+        setPackageManagerWidget(ctx, {
+            mode: "installing",
+            packages: availableUpdates.length,
+        })
 
         const result = await pi.exec("pi", [...UPDATE_COMMAND], {
             cwd: ctx.cwd,
@@ -477,33 +453,20 @@ async function runUpdate(
                 packagesUpdated: availableUpdates.length,
             })
 
-            if (options.automatic) {
-                pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
-                pi.appendEntry(
-                    REPORT_ENTRY_TYPE,
-                    createAutoUpdateResultReport({
-                        record,
-                        output,
-                        reloadAfterSeconds: RELOAD_COUNTDOWN_SECONDS,
-                    }),
-                )
-                await runReloadCountdown(ctx)
-                clearPackageManagerWidget(ctx)
-                shouldClearAutomaticWidget = false
-                await ctx.reload()
-                return { autoUpdateRecord: record }
-            }
-
+            pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
             pi.appendEntry(
                 REPORT_ENTRY_TYPE,
-                createManualUpdateReport({
-                    outcome: "succeeded",
-                    packagesUpdated: availableUpdates.length,
+                createAutoUpdateResultReport({
+                    record,
                     output,
+                    reloadAfterSeconds: RELOAD_COUNTDOWN_SECONDS,
                 }),
             )
+            await runReloadCountdown(ctx)
+            clearPackageManagerWidget(ctx)
+            shouldClearWidget = false
             await ctx.reload()
-            return {}
+            return { autoUpdateRecord: record }
         }
 
         const record = createAutoUpdateRecord({
@@ -514,33 +477,20 @@ async function runUpdate(
             reason: getExecFailureDetail(result),
         })
 
-        if (options.automatic) {
-            pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createAutoUpdateResultReport({ record, output }),
-            )
-
-            if (ctx.hasUI) {
-                ctx.ui.notify(
-                    "Pi Package Manager automatic startup update failed. See transcript for details.",
-                    "error",
-                )
-            }
-
-            return { autoUpdateRecord: record }
-        }
-
+        pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
         pi.appendEntry(
             REPORT_ENTRY_TYPE,
-            createManualUpdateReport({
-                outcome: "failed",
-                packagesUpdated: 0,
-                reason: record.reason,
-                output,
-            }),
+            createAutoUpdateResultReport({ record, output }),
         )
-        return {}
+
+        if (options.startupTriggered && ctx.hasUI) {
+            ctx.ui.notify(
+                "Pi Package Manager automatic startup update failed. See transcript for details.",
+                "error",
+            )
+        }
+
+        return { autoUpdateRecord: record }
     } catch (error) {
         const record = createAutoUpdateRecord({
             startedAtUtc,
@@ -550,31 +500,19 @@ async function runUpdate(
             reason: getErrorMessage(error),
         })
 
-        if (options.automatic) {
-            pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
-            pi.appendEntry(REPORT_ENTRY_TYPE, createAutoUpdateResultReport({ record }))
+        pi.appendEntry(AUTO_UPDATE_RECORD_ENTRY_TYPE, record)
+        pi.appendEntry(REPORT_ENTRY_TYPE, createAutoUpdateResultReport({ record }))
 
-            if (ctx.hasUI) {
-                ctx.ui.notify(
-                    "Pi Package Manager automatic startup update failed. See transcript for details.",
-                    "error",
-                )
-            }
-
-            return { autoUpdateRecord: record }
+        if (options.startupTriggered && ctx.hasUI) {
+            ctx.ui.notify(
+                "Pi Package Manager automatic startup update failed. See transcript for details.",
+                "error",
+            )
         }
 
-        pi.appendEntry(
-            REPORT_ENTRY_TYPE,
-            createManualUpdateReport({
-                outcome: "failed",
-                packagesUpdated: 0,
-                reason: record.reason,
-            }),
-        )
-        return {}
+        return { autoUpdateRecord: record }
     } finally {
-        if (shouldClearAutomaticWidget) {
+        if (shouldClearWidget) {
             clearPackageManagerWidget(ctx)
         }
     }
@@ -661,6 +599,15 @@ function clearPackageManagerWidget(ctx: ExtensionContext): void {
     }
 
     ctx.ui.setWidget(PACKAGE_MANAGER_WIDGET_KEY, undefined)
+}
+
+function formatExpandHint(
+    theme: { fg(token: string, text: string): string },
+    description: string,
+): string {
+    const expandKey = keyText("app.tools.expand") || "Ctrl+O"
+
+    return `${theme.fg("dim", expandKey)}${theme.fg("muted", ` ${description}`)}`
 }
 
 function formatReportOutput(
