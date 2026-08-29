@@ -14,9 +14,7 @@
 ## Install only this extension
 
 ```bash
-git clone https://github.com/gaosh3n/pi-extensions.git
-cd pi-extensions
-pi install ./packages/pi-package-manager/index.ts
+pi install npm:@gaosh3n/pi-package-manager
 ```
 
 Then restart Pi or run `/reload`.
