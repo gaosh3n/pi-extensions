@@ -1,7 +1,7 @@
-import test from "node:test"
 import assert from "node:assert/strict"
+import test from "node:test"
 
-import { DefaultPackageManager } from "@earendil-works/pi-coding-agent"
+import { type ExecResult } from "@earendil-works/pi-coding-agent"
 
 import init, {
     AUTO_UPDATE_RECORD_ENTRY_TYPE,
@@ -10,6 +10,8 @@ import init, {
     createAutomaticUpdateWidgetLines,
     createAutoUpdateResultReport,
     createStatusReport,
+    type AutoUpdateRecord,
+    type PackageManagerDeps,
 } from "./index.ts"
 
 interface CapturedEntry {
@@ -24,6 +26,7 @@ interface CapturedWidgetCall {
 
 interface Harness {
     entries: CapturedEntry[]
+    notifications: Array<{ message: string; level: string }>
     sentUserMessages: Array<{ message: string; options: unknown }>
     statuses: Array<{ key: string; text: string | undefined }>
     widgets: CapturedWidgetCall[]
@@ -43,23 +46,45 @@ interface Harness {
 }
 
 function createHarness(options?: {
-    exec?: () => Promise<{ code: number; stdout: string; stderr: string }>
+    deps?: Partial<PackageManagerDeps>
+    nowIsoValues?: string[]
+    sessionEntries?: any[]
 }): Harness {
     const entries: CapturedEntry[] = []
+    const notifications: Array<{ message: string; level: string }> = []
     const sentUserMessages: Array<{ message: string; options: unknown }> = []
     const statuses: Array<{ key: string; text: string | undefined }> = []
     const widgets: CapturedWidgetCall[] = []
+    const sessionEntries = [...(options?.sessionEntries ?? [])]
 
     let reportRenderer: Harness["reportRenderer"]
     let sessionStartHandler: Harness["sessionStartHandler"] | undefined
     let commandHandler: Harness["commandHandler"] | undefined
+
+    const nowIsoValues = options?.nowIsoValues ?? [
+        "2025-08-27T13:42:01.000Z",
+        "2025-08-27T13:42:02.000Z",
+        "2025-08-27T13:42:03.000Z",
+        "2025-08-27T13:42:04.000Z",
+    ]
+    let nowIsoIndex = 0
+
+    const deps: PackageManagerDeps = {
+        nowIso: () => nowIsoValues[Math.min(nowIsoIndex++, nowIsoValues.length - 1)]!,
+        sleep: async () => {},
+        isOffline: () => false,
+        checkForAvailableUpdates: async () => [],
+        runNativeUpdate: async () =>
+            createExecResult({ code: 0, stdout: "", stderr: "" }),
+        ...options?.deps,
+    }
 
     const ctx = {
         cwd: process.cwd(),
         signal: undefined,
         mode: "tui",
         hasUI: true,
-        sessionManager: { getEntries: () => [] },
+        sessionManager: { getEntries: () => sessionEntries },
         modelRegistry: {},
         model: undefined,
         scopedModels: [],
@@ -79,7 +104,9 @@ function createHarness(options?: {
         switchSession: async () => ({ cancelled: false }),
         reload: async () => {},
         ui: {
-            notify() {},
+            notify(message: string, level: string) {
+                notifications.push({ message, level })
+            },
             setStatus(key: string, text: string | undefined) {
                 statuses.push({ key, text })
             },
@@ -89,37 +116,37 @@ function createHarness(options?: {
         },
     }
 
-    init({
-        registerEntryRenderer(_type: string, renderer: Harness["reportRenderer"]) {
-            reportRenderer = renderer
-        },
-        on(event: string, handler: Harness["sessionStartHandler"]) {
-            if (event === "session_start") {
-                sessionStartHandler = handler
-            }
-        },
-        sendUserMessage(message: string, sendOptions: unknown) {
-            sentUserMessages.push({ message, options: sendOptions })
-        },
-        registerCommand(
-            name: string,
-            commandOptions: { handler: Harness["commandHandler"] },
-        ) {
-            if (name === "package-manager") {
-                commandHandler = commandOptions.handler
-            }
-        },
-        appendEntry(type: string, data?: unknown) {
-            entries.push({ type, data })
-        },
-        async exec() {
-            if (options?.exec) {
-                return options.exec()
-            }
-
-            throw new Error("exec should not run in offline test")
-        },
-    } as any)
+    init(
+        {
+            registerEntryRenderer(_type: string, renderer: Harness["reportRenderer"]) {
+                reportRenderer = renderer
+            },
+            on(event: string, handler: Harness["sessionStartHandler"]) {
+                if (event === "session_start") {
+                    sessionStartHandler = handler
+                }
+            },
+            sendUserMessage(message: string, sendOptions: unknown) {
+                sentUserMessages.push({ message, options: sendOptions })
+            },
+            registerCommand(
+                name: string,
+                commandOptions: { handler: Harness["commandHandler"] },
+            ) {
+                if (name === "package-manager") {
+                    commandHandler = commandOptions.handler
+                }
+            },
+            appendEntry(type: string, data?: unknown) {
+                entries.push({ type, data })
+                sessionEntries.push({ type: "custom", customType: type, data })
+            },
+            async exec() {
+                throw new Error("exec should not be called when using injected deps")
+            },
+        } as any,
+        deps,
+    )
 
     if (!sessionStartHandler || !commandHandler) {
         throw new Error("package manager did not register expected handlers")
@@ -127,6 +154,7 @@ function createHarness(options?: {
 
     return {
         entries,
+        notifications,
         sentUserMessages,
         statuses,
         widgets,
@@ -134,6 +162,27 @@ function createHarness(options?: {
         sessionStartHandler,
         commandHandler,
         ctx,
+    }
+}
+
+function createSessionRecordEntry(record: AutoUpdateRecord) {
+    return {
+        type: "custom",
+        customType: AUTO_UPDATE_RECORD_ENTRY_TYPE,
+        data: record,
+    }
+}
+
+function createExecResult(input: {
+    code: number
+    stdout: string
+    stderr: string
+}): ExecResult {
+    return {
+        code: input.code,
+        stdout: input.stdout,
+        stderr: input.stderr,
+        killed: false,
     }
 }
 
@@ -333,219 +382,281 @@ test("status report renderer uses a semantic section label instead of update out
 })
 
 test("slash status shows a widget immediately and clears it after completion", async () => {
-    const originalCheckForAvailableUpdates =
-        DefaultPackageManager.prototype.checkForAvailableUpdates
+    let resolveUpdates: ((value: string[]) => void) | undefined
 
-    let resolveUpdates: ((value: Array<{ displayName: string }>) => void) | undefined
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: () =>
+                new Promise((resolve) => {
+                    resolveUpdates = resolve as typeof resolveUpdates
+                }),
+        },
+    })
+    const pending = harness.commandHandler("status", harness.ctx)
 
-    try {
-        DefaultPackageManager.prototype.checkForAvailableUpdates = () =>
-            new Promise((resolve) => {
-                resolveUpdates = resolve as typeof resolveUpdates
-            }) as any
+    assert.equal(harness.widgets.length, 1)
+    assert.equal(harness.widgets[0]?.key, "pi-package-manager")
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+    assert.equal(harness.entries.length, 0)
 
-        const harness = createHarness()
-        const pending = harness.commandHandler("status", harness.ctx)
+    resolveUpdates?.(["alpha"])
+    await pending
 
-        assert.equal(harness.widgets.length, 1)
-        assert.equal(harness.widgets[0]?.key, "pi-package-manager")
-        assert.equal(typeof harness.widgets[0]?.content, "function")
-        assert.equal(harness.entries.length, 0)
-
-        resolveUpdates?.([{ displayName: "alpha" }])
-        await pending
-
-        assert.equal(harness.entries.length, 1)
-        assert.equal(harness.entries[0]?.type, REPORT_ENTRY_TYPE)
-        assert.deepEqual(harness.widgets[1], {
-            key: "pi-package-manager",
-            content: undefined,
-        })
-    } finally {
-        DefaultPackageManager.prototype.checkForAvailableUpdates =
-            originalCheckForAvailableUpdates
-    }
+    assert.equal(harness.entries.length, 1)
+    assert.equal(harness.entries[0]?.type, REPORT_ENTRY_TYPE)
+    assert.deepEqual(harness.widgets[1], {
+        key: "pi-package-manager",
+        content: undefined,
+    })
 })
 
 test("slash update reuses the auto-update report flow", async () => {
-    const originalOffline = process.env.PI_OFFLINE
-    process.env.PI_OFFLINE = "1"
+    const harness = createHarness({
+        deps: {
+            isOffline: () => true,
+        },
+    })
+    await harness.commandHandler("update", harness.ctx)
 
-    try {
-        const harness = createHarness()
-        await harness.commandHandler("update", harness.ctx)
+    assert.deepEqual(harness.statuses, [])
+    assert.equal(harness.entries.length, 2)
+    assert.equal(harness.entries[0]?.type, AUTO_UPDATE_RECORD_ENTRY_TYPE)
+    assert.equal(harness.entries[1]?.type, REPORT_ENTRY_TYPE)
+    assert.equal(harness.widgets.length, 2)
+    assert.equal(harness.widgets[0]?.key, "pi-package-manager")
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+    assert.deepEqual(harness.widgets[1], {
+        key: "pi-package-manager",
+        content: undefined,
+    })
+})
 
-        assert.deepEqual(harness.statuses, [])
-        assert.equal(harness.entries.length, 2)
-        assert.equal(harness.entries[0]?.type, AUTO_UPDATE_RECORD_ENTRY_TYPE)
-        assert.equal(harness.entries[1]?.type, REPORT_ENTRY_TYPE)
-        assert.equal(harness.widgets.length, 2)
-        assert.equal(harness.widgets[0]?.key, "pi-package-manager")
-        assert.equal(typeof harness.widgets[0]?.content, "function")
-        assert.deepEqual(harness.widgets[1], {
-            key: "pi-package-manager",
-            content: undefined,
-        })
-    } finally {
-        process.env.PI_OFFLINE = originalOffline
+test("manual update writes an auto-update record and reloads on success", async () => {
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => ["alpha"],
+            runNativeUpdate: async () =>
+                createExecResult({
+                    code: 0,
+                    stdout: "updated",
+                    stderr: "",
+                }),
+            sleep: async () => {},
+        },
+    })
+    let reloads = 0
+    harness.ctx.reload = async () => {
+        reloads += 1
     }
+
+    await harness.commandHandler("update", harness.ctx)
+
+    assert.equal(reloads, 1)
+    assert.equal(harness.entries[0]?.type, AUTO_UPDATE_RECORD_ENTRY_TYPE)
+    assert.deepEqual((harness.entries[0] as { data: AutoUpdateRecord }).data, {
+        startedAtUtc: "2025-08-27T13:42:01.000Z",
+        endedAtUtc: "2025-08-27T13:42:02.000Z",
+        outcome: "succeeded",
+        packagesUpdated: 1,
+        reason: undefined,
+    })
+    assert.equal(harness.entries[1]?.type, REPORT_ENTRY_TYPE)
+})
+
+test("status reads the latest record regardless of trigger source", async () => {
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => ["alpha"],
+        },
+        sessionEntries: [
+            createSessionRecordEntry({
+                startedAtUtc: "2025-08-27T13:42:01.000Z",
+                endedAtUtc: "2025-08-27T13:42:02.000Z",
+                outcome: "succeeded",
+                packagesUpdated: 1,
+            }),
+            createSessionRecordEntry({
+                startedAtUtc: "2025-08-27T14:00:01.000Z",
+                endedAtUtc: "2025-08-27T14:00:02.000Z",
+                outcome: "failed",
+                packagesUpdated: 0,
+                reason: "boom",
+            }),
+        ],
+    })
+
+    await harness.commandHandler("status", harness.ctx)
+
+    assert.deepEqual(harness.entries[0], {
+        type: REPORT_ENTRY_TYPE,
+        data: {
+            title: PACKAGE_MANAGER_TITLE,
+            headline: "1 package update is available.",
+            tone: "warning",
+            lines: [
+                "Latest update start: 2025-08-27 14:00:01 UTC+00",
+                "Latest update end: 2025-08-27 14:00:02 UTC+00",
+                "Latest update result: failed",
+                "Latest update packages updated: 0",
+                "Latest update detail: boom",
+            ],
+            lineTone: "dim",
+            output: "- alpha",
+            outputLabel: "Available updates:",
+            outputTone: "dim",
+        },
+    })
+})
+
+test("startup-triggered failure notifies but manual failure does not", async () => {
+    const deps = {
+        checkForAvailableUpdates: async () => ["alpha"],
+        runNativeUpdate: async () =>
+            createExecResult({ code: 1, stdout: "", stderr: "boom" }),
+    } satisfies Partial<PackageManagerDeps>
+
+    const startupHarness = createHarness({ deps })
+    await startupHarness.commandHandler("update --startup", startupHarness.ctx)
+
+    assert.deepEqual(startupHarness.notifications, [
+        {
+            message:
+                "Pi Package Manager automatic startup update failed. See transcript for details.",
+            level: "error",
+        },
+    ])
+
+    const manualHarness = createHarness({ deps })
+    await manualHarness.commandHandler("update", manualHarness.ctx)
+
+    assert.deepEqual(manualHarness.notifications, [])
 })
 
 test("automatic startup update records skipped outcome and appends a final report", async () => {
-    const originalOffline = process.env.PI_OFFLINE
-    process.env.PI_OFFLINE = "1"
+    const harness = createHarness({
+        deps: {
+            isOffline: () => true,
+        },
+    })
+    await harness.sessionStartHandler({ reason: "startup" }, harness.ctx)
 
-    try {
-        const harness = createHarness()
-        await harness.sessionStartHandler({ reason: "startup" }, harness.ctx)
+    assert.deepEqual(harness.sentUserMessages, [
+        {
+            message: "/package-manager update --startup",
+            options: { expandPromptTemplates: true },
+        },
+    ])
 
-        assert.deepEqual(harness.sentUserMessages, [
-            {
-                message: "/package-manager update --startup",
-                options: { expandPromptTemplates: true },
-            },
-        ])
+    await harness.commandHandler("update --startup", harness.ctx)
 
-        await harness.commandHandler("update --startup", harness.ctx)
-
-        assert.deepEqual(harness.statuses, [])
-        assert.equal(harness.entries.length, 2)
-        assert.equal(harness.entries[0]?.type, AUTO_UPDATE_RECORD_ENTRY_TYPE)
-        assert.deepEqual(harness.entries[1], {
-            type: REPORT_ENTRY_TYPE,
-            data: {
-                title: PACKAGE_MANAGER_TITLE,
-                tone: "info",
-                headline: "Pi package(s) update skipped.",
-                lines: [
-                    `Start: ${String(
-                        (harness.entries[0] as { data: { startedAtUtc: string } }).data
-                            .startedAtUtc,
-                    )
-                        .replace("T", " ")
-                        .replace(/\.\d{3}Z$/, " UTC+00")}`,
-                    `End: ${String(
-                        (harness.entries[0] as { data: { endedAtUtc: string } }).data
-                            .endedAtUtc,
-                    )
-                        .replace("T", " ")
-                        .replace(/\.\d{3}Z$/, " UTC+00")}`,
-                    "Result: skipped",
-                    "Packages updated: 0",
-                ],
-                lineTone: "dim",
-                output: "PI_OFFLINE is set.",
-                outputTone: "dim",
-                hideOutputWhenCollapsed: true,
-            },
-        })
-        assert.equal(harness.widgets.length, 2)
-        assert.equal(harness.widgets[0]?.key, "pi-package-manager")
-        assert.equal(typeof harness.widgets[0]?.content, "function")
-        assert.deepEqual(harness.widgets[1], {
-            key: "pi-package-manager",
-            content: undefined,
-        })
-    } finally {
-        process.env.PI_OFFLINE = originalOffline
-    }
+    assert.deepEqual(harness.statuses, [])
+    assert.equal(harness.entries.length, 2)
+    assert.deepEqual(harness.entries[0], {
+        type: AUTO_UPDATE_RECORD_ENTRY_TYPE,
+        data: {
+            startedAtUtc: "2025-08-27T13:42:01.000Z",
+            endedAtUtc: "2025-08-27T13:42:02.000Z",
+            outcome: "skipped",
+            packagesUpdated: 0,
+            reason: "PI_OFFLINE is set.",
+        },
+    })
+    assert.deepEqual(harness.entries[1], {
+        type: REPORT_ENTRY_TYPE,
+        data: {
+            title: PACKAGE_MANAGER_TITLE,
+            tone: "info",
+            headline: "Pi package(s) update skipped.",
+            lines: [
+                "Start: 2025-08-27 13:42:01 UTC+00",
+                "End: 2025-08-27 13:42:02 UTC+00",
+                "Result: skipped",
+                "Packages updated: 0",
+            ],
+            lineTone: "dim",
+            output: "PI_OFFLINE is set.",
+            outputTone: "dim",
+            hideOutputWhenCollapsed: true,
+        },
+    })
+    assert.equal(harness.widgets.length, 2)
+    assert.equal(harness.widgets[0]?.key, "pi-package-manager")
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+    assert.deepEqual(harness.widgets[1], {
+        key: "pi-package-manager",
+        content: undefined,
+    })
 })
 
 test("automatic startup update reports no-update skip as a final report", async () => {
-    const originalOffline = process.env.PI_OFFLINE
-    const originalCheckForAvailableUpdates =
-        DefaultPackageManager.prototype.checkForAvailableUpdates
-    delete process.env.PI_OFFLINE
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => [],
+        },
+    })
+    await harness.commandHandler("update --startup", harness.ctx)
 
-    try {
-        DefaultPackageManager.prototype.checkForAvailableUpdates = async () => [] as any
-
-        const harness = createHarness()
-        await harness.commandHandler("update --startup", harness.ctx)
-
-        assert.equal(harness.entries.length, 2)
-        assert.equal(harness.entries[0]?.type, AUTO_UPDATE_RECORD_ENTRY_TYPE)
-        assert.deepEqual(harness.entries[1], {
-            type: REPORT_ENTRY_TYPE,
-            data: {
-                title: PACKAGE_MANAGER_TITLE,
-                tone: "info",
-                headline: "Pi package(s) update skipped.",
-                lines: [
-                    `Start: ${String(
-                        (harness.entries[0] as { data: { startedAtUtc: string } }).data
-                            .startedAtUtc,
-                    )
-                        .replace("T", " ")
-                        .replace(/\.\d{3}Z$/, " UTC+00")}`,
-                    `End: ${String(
-                        (harness.entries[0] as { data: { endedAtUtc: string } }).data
-                            .endedAtUtc,
-                    )
-                        .replace("T", " ")
-                        .replace(/\.\d{3}Z$/, " UTC+00")}`,
-                    "Result: skipped",
-                    "Packages updated: 0",
-                ],
-                lineTone: "dim",
-                output: "No package updates are available.",
-                outputTone: "dim",
-                hideOutputWhenCollapsed: true,
-            },
-        })
-    } finally {
-        process.env.PI_OFFLINE = originalOffline
-        DefaultPackageManager.prototype.checkForAvailableUpdates =
-            originalCheckForAvailableUpdates
-    }
+    assert.equal(harness.entries.length, 2)
+    assert.deepEqual(harness.entries[0], {
+        type: AUTO_UPDATE_RECORD_ENTRY_TYPE,
+        data: {
+            startedAtUtc: "2025-08-27T13:42:01.000Z",
+            endedAtUtc: "2025-08-27T13:42:02.000Z",
+            outcome: "skipped",
+            packagesUpdated: 0,
+            reason: "No package updates are available.",
+        },
+    })
+    assert.deepEqual(harness.entries[1], {
+        type: REPORT_ENTRY_TYPE,
+        data: {
+            title: PACKAGE_MANAGER_TITLE,
+            tone: "info",
+            headline: "Pi package(s) update skipped.",
+            lines: [
+                "Start: 2025-08-27 13:42:01 UTC+00",
+                "End: 2025-08-27 13:42:02 UTC+00",
+                "Result: skipped",
+                "Packages updated: 0",
+            ],
+            lineTone: "dim",
+            output: "No package updates are available.",
+            outputTone: "dim",
+            hideOutputWhenCollapsed: true,
+        },
+    })
 })
 
 test("automatic startup update does not touch stale ctx after reload", async () => {
-    const originalOffline = process.env.PI_OFFLINE
-    const originalCheckForAvailableUpdates =
-        DefaultPackageManager.prototype.checkForAvailableUpdates
-    const originalSetTimeout = globalThis.setTimeout
-    delete process.env.PI_OFFLINE
-
-    try {
-        DefaultPackageManager.prototype.checkForAvailableUpdates = async () =>
-            [{ displayName: "pi-package-manager" }] as any
-        globalThis.setTimeout = ((callback: (...args: never[]) => void) => {
-            callback()
-            return 0 as never
-        }) as unknown as typeof setTimeout
-
-        const harness = createHarness({
-            exec: async () => ({ code: 0, stdout: "updated", stderr: "" }),
-        })
-        let reloaded = false
-        harness.ctx.reload = async () => {
-            reloaded = true
-        }
-        harness.ctx.ui.setWidget = (key: string, content: unknown) => {
-            if (reloaded) {
-                throw new Error("This extension ctx is stale after reload")
-            }
-
-            harness.widgets.push({ key, content })
-        }
-        ;(
-            harness.ctx.ui as { notify: (message: string, level: string) => void }
-        ).notify = (message: string, level: string) => {
-            if (reloaded) {
-                throw new Error("This extension ctx is stale after reload")
-            }
-
-            void message
-            void level
-        }
-        await assert.doesNotReject(() =>
-            harness.commandHandler("update --startup", harness.ctx),
-        )
-    } finally {
-        process.env.PI_OFFLINE = originalOffline
-        DefaultPackageManager.prototype.checkForAvailableUpdates =
-            originalCheckForAvailableUpdates
-        globalThis.setTimeout = originalSetTimeout
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => ["pi-package-manager"],
+            runNativeUpdate: async () =>
+                createExecResult({ code: 0, stdout: "updated", stderr: "" }),
+            sleep: async () => {},
+        },
+    })
+    let reloaded = false
+    harness.ctx.reload = async () => {
+        reloaded = true
     }
+    harness.ctx.ui.setWidget = (key: string, content: unknown) => {
+        if (reloaded) {
+            throw new Error("This extension ctx is stale after reload")
+        }
+
+        harness.widgets.push({ key, content })
+    }
+    harness.ctx.ui.notify = (message: string, level: string) => {
+        if (reloaded) {
+            throw new Error("This extension ctx is stale after reload")
+        }
+
+        void message
+        void level
+    }
+
+    await assert.doesNotReject(() =>
+        harness.commandHandler("update --startup", harness.ctx),
+    )
 })
