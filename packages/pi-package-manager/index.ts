@@ -27,6 +27,7 @@ import {
     createAutoUpdateResultReport,
     createInstallResultReport,
     createReportEntryRenderer,
+    createUninstallResultReport,
     createStatusReport,
     formatStatusLines,
     formatUtcTimestamp,
@@ -51,9 +52,9 @@ export default function initPackageManager(
 
     pi.registerCommand("package-manager", {
         description:
-            "Manage Pi packages (usage: /package-manager [status|update|install])",
+            "Manage Pi packages (usage: /package-manager [status|update|install|uninstall])",
         getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-            const items = ["status", "update", "install"].map((value) => ({
+            const items = ["status", "update", "install", "uninstall"].map((value) => ({
                 value,
                 label: value,
             }))
@@ -84,7 +85,15 @@ export default function initPackageManager(
                 return
             }
 
-            ctx.ui.notify("Usage: /package-manager [status|update|install]", "warning")
+            if (subcommand === "uninstall") {
+                await controller.handleUninstall(ctx)
+                return
+            }
+
+            ctx.ui.notify(
+                "Usage: /package-manager [status|update|install|uninstall]",
+                "warning",
+            )
         },
     })
 }
@@ -97,6 +106,7 @@ export {
     createAutoUpdateRecord,
     createAutoUpdateResultReport,
     createInstallResultReport,
+    createUninstallResultReport,
     createStatusReport,
     formatStatusLines,
     formatUtcTimestamp,

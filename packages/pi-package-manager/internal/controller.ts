@@ -17,11 +17,13 @@ import {
     createInstallResultReport,
     createStatusErrorReport,
     createStatusReport,
+    createUninstallResultReport,
     getExecDisplayOutput,
     getExecFailureDetail,
     setPackageManagerWidget,
 } from "./reports.ts"
 import { defaultPackageManagerDeps, type PackageManagerDeps } from "./runtime.ts"
+import { promptForPackagesToUninstall } from "./uninstall-picker.ts"
 
 export function createPackageManagerController(
     pi: Pick<ExtensionAPI, "appendEntry" | "sendUserMessage" | "exec">,
@@ -32,6 +34,7 @@ export function createPackageManagerController(
         handleStatus,
         handleUpdate,
         handleInstall,
+        handleUninstall,
     }
 
     async function onSessionStart(
@@ -136,7 +139,7 @@ export function createPackageManagerController(
                 endedAtUtc: deps.nowIso(),
                 outcome: "failed",
                 packagesUpdated: 0,
-                reason: getExecFailureDetail(result),
+                reason: getExecFailureDetail(result, "Package update command failed."),
             })
 
             appendAutoUpdateRecordAndReport(
@@ -221,7 +224,10 @@ export function createPackageManagerController(
                     source,
                     outcome: "failed",
                     output,
-                    reason: getExecFailureDetail(result),
+                    reason: getExecFailureDetail(
+                        result,
+                        "Package install command failed.",
+                    ),
                 }),
             )
         } catch (error) {
@@ -233,6 +239,124 @@ export function createPackageManagerController(
                     source,
                     outcome: "failed",
                     reason: getErrorMessage(error),
+                }),
+            )
+        } finally {
+            clearPackageManagerWidget(ctx)
+        }
+    }
+
+    async function handleUninstall(ctx: ExtensionCommandContext): Promise<void> {
+        if (ctx.mode !== "tui") {
+            ctx.ui.notify("/package-manager uninstall requires TUI mode.", "warning")
+            return
+        }
+
+        const packages = await deps.listConfiguredPackages(ctx)
+
+        if (packages.length === 0) {
+            ctx.ui.notify("No Pi packages are available to uninstall.", "info")
+            return
+        }
+
+        const selectedSources = await promptForPackagesToUninstall(ctx, packages)
+
+        if (selectedSources === undefined) {
+            return
+        }
+
+        if (selectedSources.length === 0) {
+            ctx.ui.notify("Select at least one package to uninstall.", "warning")
+            return
+        }
+
+        const selectedSourceSet = new Set(selectedSources)
+        const sources = packages
+            .map((pkg) => pkg.source)
+            .filter((source) => selectedSourceSet.has(source))
+
+        if (sources.length === 0) {
+            ctx.ui.notify("Select at least one package to uninstall.", "warning")
+            return
+        }
+
+        const startedAtUtc = deps.nowIso()
+        const succeededSources: string[] = []
+        const failedSources: string[] = []
+        const outputSections: string[] = []
+
+        try {
+            for (const [index, source] of sources.entries()) {
+                setPackageManagerWidget(ctx, {
+                    mode: "package-uninstalling",
+                    current: index + 1,
+                    total: sources.length,
+                    source,
+                })
+
+                const result = await deps.runNativeUninstall(pi, ctx, source)
+                const output = getExecDisplayOutput(result)
+
+                if (result.code === 0) {
+                    if (output) {
+                        outputSections.push(`[${source}]\n${output}`)
+                    }
+                    succeededSources.push(source)
+                    continue
+                }
+
+                failedSources.push(source)
+                outputSections.push(
+                    `[${source}]\n${output ?? getExecFailureDetail(result, "Package uninstall command failed.")}`,
+                )
+            }
+
+            pi.appendEntry(
+                REPORT_ENTRY_TYPE,
+                createUninstallResultReport({
+                    startedAtUtc,
+                    endedAtUtc: deps.nowIso(),
+                    sources,
+                    outcome:
+                        failedSources.length === 0
+                            ? "succeeded"
+                            : succeededSources.length > 0
+                              ? "partial"
+                              : "failed",
+                    succeededSources,
+                    failedSources,
+                    output:
+                        outputSections.length > 0
+                            ? outputSections.join("\n\n")
+                            : undefined,
+                    reason:
+                        failedSources.length > 0
+                            ? `Failed to uninstall ${failedSources[0]}.`
+                            : undefined,
+                }),
+            )
+        } catch (error) {
+            const failedSource = sources[succeededSources.length]
+            const errorMessage = getErrorMessage(error)
+
+            if (failedSource && !failedSources.includes(failedSource)) {
+                failedSources.push(failedSource)
+            }
+
+            outputSections.push(
+                failedSource ? `[${failedSource}]\n${errorMessage}` : errorMessage,
+            )
+            pi.appendEntry(
+                REPORT_ENTRY_TYPE,
+                createUninstallResultReport({
+                    startedAtUtc,
+                    endedAtUtc: deps.nowIso(),
+                    sources,
+                    outcome: succeededSources.length > 0 ? "partial" : "failed",
+                    succeededSources,
+                    failedSources,
+                    output: outputSections.join("\n\n"),
+                    reason: errorMessage,
                 }),
             )
         } finally {

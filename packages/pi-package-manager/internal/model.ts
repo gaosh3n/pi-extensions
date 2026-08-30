@@ -6,9 +6,11 @@ export const RELOAD_COUNTDOWN_SECONDS = 5
 export const OUTPUT_PREVIEW_LINE_COUNT = 8
 export const UPDATE_COMMAND = ["update", "--extensions"] as const
 export const INSTALL_COMMAND = ["install"] as const
+export const UNINSTALL_COMMAND = ["uninstall"] as const
 
 export type AutoUpdateOutcome = "succeeded" | "failed" | "skipped"
 export type InstallOutcome = "succeeded" | "failed"
+export type UninstallOutcome = "succeeded" | "partial" | "failed"
 export type ReportTone = "info" | "success" | "warning" | "error"
 
 export type WidgetState =
@@ -17,6 +19,12 @@ export type WidgetState =
     | { mode: "installing"; packages: number }
     | { mode: "countdown"; secondsRemaining: number }
     | { mode: "package-installing"; source: string }
+    | {
+          mode: "package-uninstalling"
+          current: number
+          total: number
+          source: string
+      }
 
 export interface AutoUpdateRecord {
     startedAtUtc: string
@@ -42,4 +50,10 @@ export interface PackageManagerReport {
 export interface PackageStatusSnapshot {
     availableUpdates: string[]
     lastAutoUpdate?: AutoUpdateRecord
+}
+
+export interface ConfiguredPackageOption {
+    source: string
+    scope: "user" | "project"
+    filtered: boolean
 }

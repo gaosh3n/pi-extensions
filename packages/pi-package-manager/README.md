@@ -9,6 +9,7 @@
 - `/package-manager status` to see whether updates are available
 - `/package-manager update` to run the update flow on demand
 - `/package-manager install` to install a Pi package from an entered source
+- `/package-manager uninstall` to remove one or more installed Pi packages from a checkbox-style picker
 - a final result card in Pi so you can review the latest outcome
 - automatic Pi reload after a successful startup update
 
@@ -55,3 +56,13 @@ Run:
 ```
 
 Pi will prompt you for a package source such as `npm:@foo/bar` or `git:github.com/user/repo`, run the native `pi install ...` flow, and show a final result card. After a successful install, run `/reload` to activate the installed package resources.
+
+### Uninstall package(s)
+
+Run:
+
+```text
+/package-manager uninstall
+```
+
+Pi will show a checkbox-style package picker. Use <space> to toggle package selection, then press Enter to confirm. Pi runs native `pi uninstall <source>` once per selected package and shows one final result card. After successful or partial removal, run `/reload` to deactivate removed package resources.

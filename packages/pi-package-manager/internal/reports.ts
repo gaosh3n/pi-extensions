@@ -14,6 +14,7 @@ import {
     type InstallOutcome,
     type PackageManagerReport,
     type PackageStatusSnapshot,
+    type UninstallOutcome,
     type WidgetState,
 } from "./model.ts"
 
@@ -246,6 +247,53 @@ export function createInstallResultReport(input: {
     }
 }
 
+export function createUninstallResultReport(input: {
+    startedAtUtc: string
+    endedAtUtc: string
+    sources: string[]
+    outcome: UninstallOutcome
+    succeededSources: string[]
+    failedSources: string[]
+    output?: string
+    reason?: string
+}): PackageManagerReport {
+    return {
+        title: PACKAGE_MANAGER_TITLE,
+        headline:
+            input.outcome === "succeeded"
+                ? "Pi package uninstall completed."
+                : input.outcome === "partial"
+                  ? "Pi package uninstall partially completed."
+                  : "Pi package uninstall failed.",
+        tone:
+            input.outcome === "succeeded"
+                ? "success"
+                : input.outcome === "partial"
+                  ? "warning"
+                  : "error",
+        lines: [
+            `Start: ${formatUtcTimestamp(input.startedAtUtc)}`,
+            `End: ${formatUtcTimestamp(input.endedAtUtc)}`,
+            `Result: ${input.outcome}`,
+            `Packages selected: ${input.sources.length}`,
+            ...input.sources.map((source) => `Package source: ${source}`),
+            `Packages removed: ${input.succeededSources.length}`,
+            ...(input.failedSources.length > 0
+                ? [`Packages failed: ${input.failedSources.length}`]
+                : ["Run /reload to deactivate removed package resources."]),
+            ...(input.reason ? [`Latest failure detail: ${input.reason}`] : []),
+        ],
+        lineTone: "dim",
+        output: input.output,
+        outputLabel:
+            input.outcome === "succeeded" ? "Uninstall output:" : "Error detail:",
+        outputDescription:
+            input.outcome === "succeeded" ? "uninstall output" : "error detail",
+        outputTone: "dim",
+        hideOutputWhenCollapsed: true,
+    }
+}
+
 export function createAutomaticUpdateWidgetLines(state: WidgetState): string[] {
     if (state.mode === "status-checking") {
         return ["Pi package status in progress.", "Checking for package updates..."]
@@ -269,6 +317,13 @@ export function createAutomaticUpdateWidgetLines(state: WidgetState): string[] {
         return [
             "Pi package install in progress.",
             `Installing package from ${state.source}...`,
+        ]
+    }
+
+    if (state.mode === "package-uninstalling") {
+        return [
+            "Pi package uninstall in progress.",
+            `Removing ${state.current}/${state.total}: ${state.source}`,
         ]
     }
 
@@ -349,10 +404,13 @@ export function getExecDisplayOutput(result: ExecResult): string | undefined {
     return sections.length > 0 ? sections.join("\n\n") : undefined
 }
 
-export function getExecFailureDetail(result: ExecResult): string {
+export function getExecFailureDetail(
+    result: ExecResult,
+    fallback = "Package command failed.",
+): string {
     const stderr = result.stderr.trim()
     const stdout = result.stdout.trim()
-    const detail = stderr || stdout || "Package update command failed."
+    const detail = stderr || stdout || fallback
 
     return detail.length > 400 ? `${detail.slice(0, 397)}...` : detail
 }
