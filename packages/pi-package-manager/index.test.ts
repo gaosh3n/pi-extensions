@@ -9,6 +9,7 @@ import init, {
     REPORT_ENTRY_TYPE,
     createAutomaticUpdateWidgetLines,
     createAutoUpdateResultReport,
+    createInstallResultReport,
     createStatusReport,
     type AutoUpdateRecord,
     type PackageManagerDeps,
@@ -24,7 +25,17 @@ interface CapturedWidgetCall {
     content: unknown
 }
 
+interface CapturedInputCall {
+    title: string
+    placeholder: string | undefined
+}
+
 interface Harness {
+    commandDescription: string | undefined
+    getArgumentCompletions:
+        | ((prefix: string) => Array<{ value: string; label: string }> | null)
+        | undefined
+    inputCalls: CapturedInputCall[]
     entries: CapturedEntry[]
     notifications: Array<{ message: string; level: string }>
     sentUserMessages: Array<{ message: string; options: unknown }>
@@ -49,6 +60,7 @@ function createHarness(options?: {
     deps?: Partial<PackageManagerDeps>
     nowIsoValues?: string[]
     sessionEntries?: any[]
+    inputReturnValue?: string | undefined
 }): Harness {
     const entries: CapturedEntry[] = []
     const notifications: Array<{ message: string; level: string }> = []
@@ -56,8 +68,11 @@ function createHarness(options?: {
     const statuses: Array<{ key: string; text: string | undefined }> = []
     const widgets: CapturedWidgetCall[] = []
     const sessionEntries = [...(options?.sessionEntries ?? [])]
+    const inputCalls: CapturedInputCall[] = []
 
     let reportRenderer: Harness["reportRenderer"]
+    let commandDescription: Harness["commandDescription"]
+    let getArgumentCompletions: Harness["getArgumentCompletions"]
     let sessionStartHandler: Harness["sessionStartHandler"] | undefined
     let commandHandler: Harness["commandHandler"] | undefined
 
@@ -75,6 +90,8 @@ function createHarness(options?: {
         isOffline: () => false,
         checkForAvailableUpdates: async () => [],
         runNativeUpdate: async () =>
+            createExecResult({ code: 0, stdout: "", stderr: "" }),
+        runNativeInstall: async () =>
             createExecResult({ code: 0, stdout: "", stderr: "" }),
         ...options?.deps,
     }
@@ -104,6 +121,10 @@ function createHarness(options?: {
         switchSession: async () => ({ cancelled: false }),
         reload: async () => {},
         ui: {
+            async input(title: string, placeholder?: string) {
+                inputCalls.push({ title, placeholder })
+                return options?.inputReturnValue
+            },
             notify(message: string, level: string) {
                 notifications.push({ message, level })
             },
@@ -131,9 +152,15 @@ function createHarness(options?: {
             },
             registerCommand(
                 name: string,
-                commandOptions: { handler: Harness["commandHandler"] },
+                commandOptions: {
+                    description?: string
+                    getArgumentCompletions?: Harness["getArgumentCompletions"]
+                    handler: Harness["commandHandler"]
+                },
             ) {
                 if (name === "package-manager") {
+                    commandDescription = commandOptions.description
+                    getArgumentCompletions = commandOptions.getArgumentCompletions
                     commandHandler = commandOptions.handler
                 }
             },
@@ -153,6 +180,9 @@ function createHarness(options?: {
     }
 
     return {
+        commandDescription,
+        getArgumentCompletions,
+        inputCalls,
         entries,
         notifications,
         sentUserMessages,
@@ -202,6 +232,15 @@ test("report factories keep the title consistent", () => {
         createStatusReport({ availableUpdates: [], lastAutoUpdate: undefined }).title,
         PACKAGE_MANAGER_TITLE,
     )
+    assert.equal(
+        createInstallResultReport({
+            startedAtUtc: "2025-08-27T13:42:01.000Z",
+            endedAtUtc: "2025-08-27T13:42:02.000Z",
+            source: "npm:@gaosh3n/pi-package-manager",
+            outcome: "succeeded",
+        }).title,
+        PACKAGE_MANAGER_TITLE,
+    )
 })
 
 test("automatic update widget lines describe progress and countdown", () => {
@@ -224,6 +263,16 @@ test("automatic update widget lines describe progress and countdown", () => {
             "Reloading in 1 second to activate updated package resources.",
         ],
     )
+    assert.deepEqual(
+        createAutomaticUpdateWidgetLines({
+            mode: "package-installing",
+            source: "npm:@gaosh3n/pi-package-manager",
+        }),
+        [
+            "Pi package install in progress.",
+            "Installing package from npm:@gaosh3n/pi-package-manager...",
+        ],
+    )
 })
 
 test("auto-update result report uses output field for skipped detail", () => {
@@ -243,6 +292,23 @@ test("auto-update result report uses output field for skipped detail", () => {
     assert.equal(report.outputTone, "dim")
     assert.equal(report.hideOutputWhenCollapsed, true)
     assert.doesNotMatch(report.lines.join("\n"), /Detail:/)
+})
+
+test("package-manager command exposes status update and install", () => {
+    const harness = createHarness()
+
+    assert.equal(
+        harness.commandDescription,
+        "Manage Pi packages (usage: /package-manager [status|update|install])",
+    )
+    assert.deepEqual(
+        harness.getArgumentCompletions?.("")?.map((item) => item.value),
+        ["status", "update", "install"],
+    )
+    assert.deepEqual(
+        harness.getArgumentCompletions?.("in")?.map((item) => item.value),
+        ["install"],
+    )
 })
 
 test("status report uses the same card vocabulary with semantic status sections", () => {
@@ -347,6 +413,39 @@ test("expanded auto-update report shows full update output", () => {
     assert.doesNotMatch(rendered, /to expand to see update output/)
 })
 
+test("collapsed install report hides install output behind an install-specific expand hint", () => {
+    const harness = createHarness()
+
+    assert.ok(harness.reportRenderer)
+
+    const component = harness.reportRenderer(
+        {
+            data: createInstallResultReport({
+                startedAtUtc: "2025-08-27T13:42:01.000Z",
+                endedAtUtc: "2025-08-27T13:42:02.000Z",
+                source: "npm:@gaosh3n/pi-package-manager",
+                outcome: "succeeded",
+                output: "installed",
+            }),
+        },
+        { expanded: false },
+        {
+            fg: (token: string, text: string) => `<${token}>${text}</${token}>`,
+            bg: (token: string, text: string) => `{${token}}${text}{/${token}}`,
+            bold: (text: string) => `*${text}*`,
+        },
+    )
+    const rendered = component.render(120).join("\n")
+
+    assert.match(rendered, /<text>Pi package install completed\.<\/text>/)
+    assert.match(
+        rendered,
+        /<dim>(?:ctrl\+o|Ctrl\+O)<\/dim><muted> to expand to see install output\.<\/muted>/,
+    )
+    assert.doesNotMatch(rendered, /Install output:/)
+    assert.doesNotMatch(rendered, /<dim>installed<\/dim>/)
+})
+
 test("status report renderer uses a semantic section label instead of update output", () => {
     const harness = createHarness()
 
@@ -426,6 +525,157 @@ test("slash update reuses the auto-update report flow", async () => {
     assert.equal(harness.widgets[0]?.key, "pi-package-manager")
     assert.equal(typeof harness.widgets[0]?.content, "function")
     assert.deepEqual(harness.widgets[1], {
+        key: "pi-package-manager",
+        content: undefined,
+    })
+})
+
+test("slash install prompts for a package source and does nothing on cancel", async () => {
+    const harness = createHarness({
+        inputReturnValue: undefined,
+    })
+
+    await harness.commandHandler("install", harness.ctx)
+
+    assert.deepEqual(harness.inputCalls, [
+        {
+            title: "Install Pi Package",
+            placeholder: "npm:@scope/pkg or git:github.com/user/repo",
+        },
+    ])
+    assert.deepEqual(harness.widgets, [])
+    assert.deepEqual(harness.entries, [])
+    assert.deepEqual(harness.notifications, [])
+})
+
+test("slash install warns and returns when the package source is blank", async () => {
+    const harness = createHarness({
+        inputReturnValue: "   ",
+    })
+
+    await harness.commandHandler("install", harness.ctx)
+
+    assert.deepEqual(harness.widgets, [])
+    assert.deepEqual(harness.entries, [])
+    assert.deepEqual(harness.notifications, [
+        {
+            message: "Package source is required.",
+            level: "warning",
+        },
+    ])
+})
+
+test("slash install shows a widget immediately, runs pi install, and appends a success report", async () => {
+    let installCall:
+        | {
+              source: string
+          }
+        | undefined
+    let resolveInstall: ((value: ExecResult) => void) | undefined
+
+    const harness = createHarness({
+        inputReturnValue: "npm:@gaosh3n/pi-package-manager",
+        deps: {
+            runNativeInstall: async (_pi, _ctx, source) => {
+                installCall = { source }
+                return new Promise((resolve) => {
+                    resolveInstall = resolve
+                })
+            },
+        },
+    })
+    const pending = harness.commandHandler("install", harness.ctx)
+    await Promise.resolve()
+
+    assert.deepEqual(harness.inputCalls, [
+        {
+            title: "Install Pi Package",
+            placeholder: "npm:@scope/pkg or git:github.com/user/repo",
+        },
+    ])
+    assert.deepEqual(installCall, {
+        source: "npm:@gaosh3n/pi-package-manager",
+    })
+    assert.equal(harness.widgets.length, 1)
+    assert.equal(harness.widgets[0]?.key, "pi-package-manager")
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+    assert.deepEqual(harness.entries, [])
+
+    resolveInstall?.(createExecResult({ code: 0, stdout: "installed", stderr: "" }))
+    await pending
+
+    assert.deepEqual(harness.entries, [
+        {
+            type: REPORT_ENTRY_TYPE,
+            data: {
+                title: PACKAGE_MANAGER_TITLE,
+                headline: "Pi package install completed.",
+                tone: "success",
+                lines: [
+                    "Start: 2025-08-27 13:42:01 UTC+00",
+                    "End: 2025-08-27 13:42:02 UTC+00",
+                    "Result: succeeded",
+                    "Package source: npm:@gaosh3n/pi-package-manager",
+                    "Run /reload to activate installed package resources.",
+                ],
+                lineTone: "dim",
+                output: "installed",
+                outputLabel: "Install output:",
+                outputDescription: "install output",
+                outputTone: "dim",
+                hideOutputWhenCollapsed: true,
+            },
+        },
+    ])
+    assert.deepEqual(harness.widgets[1], {
+        key: "pi-package-manager",
+        content: undefined,
+    })
+})
+
+test("slash install appends a failure report and does not write auto-update records", async () => {
+    const harness = createHarness({
+        inputReturnValue: "npm:@gaosh3n/pi-package-manager",
+        deps: {
+            runNativeInstall: async () =>
+                createExecResult({ code: 1, stdout: "", stderr: "boom" }),
+        },
+    })
+    let reloads = 0
+    harness.ctx.reload = async () => {
+        reloads += 1
+    }
+
+    await harness.commandHandler("install", harness.ctx)
+
+    assert.equal(reloads, 0)
+    assert.deepEqual(harness.entries, [
+        {
+            type: REPORT_ENTRY_TYPE,
+            data: {
+                title: PACKAGE_MANAGER_TITLE,
+                headline: "Pi package install failed.",
+                tone: "error",
+                lines: [
+                    "Start: 2025-08-27 13:42:01 UTC+00",
+                    "End: 2025-08-27 13:42:02 UTC+00",
+                    "Result: failed",
+                    "Package source: npm:@gaosh3n/pi-package-manager",
+                ],
+                lineTone: "dim",
+                output: "[stderr]\nboom",
+                outputLabel: "Error detail:",
+                outputDescription: "error detail",
+                outputTone: "dim",
+                hideOutputWhenCollapsed: true,
+            },
+        },
+    ])
+    assert.equal(
+        harness.entries.some((entry) => entry.type === AUTO_UPDATE_RECORD_ENTRY_TYPE),
+        false,
+    )
+    assert.deepEqual(harness.widgets.at(-1), {
         key: "pi-package-manager",
         content: undefined,
     })
@@ -575,6 +825,8 @@ test("automatic startup update records skipped outcome and appends a final repor
             ],
             lineTone: "dim",
             output: "PI_OFFLINE is set.",
+            outputLabel: "Update output:",
+            outputDescription: "update output",
             outputTone: "dim",
             hideOutputWhenCollapsed: true,
         },
@@ -621,6 +873,8 @@ test("automatic startup update reports no-update skip as a final report", async 
             ],
             lineTone: "dim",
             output: "No package updates are available.",
+            outputLabel: "Update output:",
+            outputDescription: "update output",
             outputTone: "dim",
             hideOutputWhenCollapsed: true,
         },

@@ -4,6 +4,6 @@ Extensions for [Pi](https://github.com/earendil-works/pi), a minimal agent harne
 
 ## Packages
 
-| Package                                                       | Description                                                                                                                            |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| [`pi-package-manager`](packages/pi-package-manager/README.md) | A Pi extension for keeping package updates organized and visible. |
+| Package                                                       | Description                                                                    |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| [`pi-package-manager`](packages/pi-package-manager/README.md) | A Pi extension for keeping package updates and installs organized and visible. |

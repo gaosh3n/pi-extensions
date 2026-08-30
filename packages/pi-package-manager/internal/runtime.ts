@@ -8,7 +8,7 @@ import {
     type ExtensionContext,
 } from "@earendil-works/pi-coding-agent"
 
-import { UPDATE_COMMAND } from "./model.ts"
+import { INSTALL_COMMAND, UPDATE_COMMAND } from "./model.ts"
 
 export interface PackageManagerDeps {
     nowIso(): string
@@ -18,6 +18,11 @@ export interface PackageManagerDeps {
     runNativeUpdate(
         pi: Pick<ExtensionAPI, "exec">,
         ctx: ExtensionCommandContext,
+    ): Promise<ExecResult>
+    runNativeInstall(
+        pi: Pick<ExtensionAPI, "exec">,
+        ctx: ExtensionCommandContext,
+        source: string,
     ): Promise<ExecResult>
 }
 
@@ -47,6 +52,16 @@ export const defaultPackageManagerDeps: PackageManagerDeps = {
     },
     runNativeUpdate(pi: Pick<ExtensionAPI, "exec">, ctx: ExtensionCommandContext) {
         return pi.exec("pi", [...UPDATE_COMMAND], {
+            cwd: ctx.cwd,
+            signal: ctx.signal,
+        })
+    },
+    runNativeInstall(
+        pi: Pick<ExtensionAPI, "exec">,
+        ctx: ExtensionCommandContext,
+        source: string,
+    ) {
+        return pi.exec("pi", [...INSTALL_COMMAND, source], {
             cwd: ctx.cwd,
             signal: ctx.signal,
         })
