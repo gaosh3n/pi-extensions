@@ -1,6 +1,6 @@
 {
     "name": "@gaosh3n/pi-package-manager",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Package Manager for Pi",
     "type": "module",
     "packageManager": "pnpm@11.23.0",
