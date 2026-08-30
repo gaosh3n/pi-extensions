@@ -14,6 +14,7 @@ import {
 import {
     clearPackageManagerWidget,
     createAutoUpdateResultReport,
+    createInstallResultReport,
     createStatusErrorReport,
     createStatusReport,
     getExecDisplayOutput,
@@ -30,6 +31,7 @@ export function createPackageManagerController(
         onSessionStart,
         handleStatus,
         handleUpdate,
+        handleInstall,
     }
 
     async function onSessionStart(
@@ -162,6 +164,79 @@ export function createPackageManagerController(
             if (shouldClearWidget) {
                 clearPackageManagerWidget(ctx)
             }
+        }
+    }
+
+    async function handleInstall(ctx: ExtensionCommandContext): Promise<void> {
+        if (!ctx.hasUI) {
+            ctx.ui.notify(
+                "/package-manager install requires dialog-capable UI.",
+                "warning",
+            )
+            return
+        }
+
+        const source = (
+            await ctx.ui.input(
+                "Install Pi Package",
+                "npm:@scope/pkg or git:github.com/user/repo",
+            )
+        )?.trim()
+
+        if (source === undefined) {
+            return
+        }
+
+        if (!source) {
+            ctx.ui.notify("Package source is required.", "warning")
+            return
+        }
+
+        const startedAtUtc = deps.nowIso()
+        setPackageManagerWidget(ctx, { mode: "package-installing", source })
+
+        try {
+            const result = await deps.runNativeInstall(pi, ctx, source)
+            const output = getExecDisplayOutput(result)
+
+            if (result.code === 0) {
+                pi.appendEntry(
+                    REPORT_ENTRY_TYPE,
+                    createInstallResultReport({
+                        startedAtUtc,
+                        endedAtUtc: deps.nowIso(),
+                        source,
+                        outcome: "succeeded",
+                        output,
+                    }),
+                )
+                return
+            }
+
+            pi.appendEntry(
+                REPORT_ENTRY_TYPE,
+                createInstallResultReport({
+                    startedAtUtc,
+                    endedAtUtc: deps.nowIso(),
+                    source,
+                    outcome: "failed",
+                    output,
+                    reason: getExecFailureDetail(result),
+                }),
+            )
+        } catch (error) {
+            pi.appendEntry(
+                REPORT_ENTRY_TYPE,
+                createInstallResultReport({
+                    startedAtUtc,
+                    endedAtUtc: deps.nowIso(),
+                    source,
+                    outcome: "failed",
+                    reason: getErrorMessage(error),
+                }),
+            )
+        } finally {
+            clearPackageManagerWidget(ctx)
         }
     }
 

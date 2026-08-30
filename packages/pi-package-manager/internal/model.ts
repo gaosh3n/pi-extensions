@@ -5,8 +5,10 @@ export const PACKAGE_MANAGER_WIDGET_KEY = "pi-package-manager"
 export const RELOAD_COUNTDOWN_SECONDS = 5
 export const OUTPUT_PREVIEW_LINE_COUNT = 8
 export const UPDATE_COMMAND = ["update", "--extensions"] as const
+export const INSTALL_COMMAND = ["install"] as const
 
 export type AutoUpdateOutcome = "succeeded" | "failed" | "skipped"
+export type InstallOutcome = "succeeded" | "failed"
 export type ReportTone = "info" | "success" | "warning" | "error"
 
 export type WidgetState =
@@ -14,6 +16,7 @@ export type WidgetState =
     | { mode: "checking" }
     | { mode: "installing"; packages: number }
     | { mode: "countdown"; secondsRemaining: number }
+    | { mode: "package-installing"; source: string }
 
 export interface AutoUpdateRecord {
     startedAtUtc: string
@@ -31,6 +34,7 @@ export interface PackageManagerReport {
     lineTone?: "default" | "dim"
     output?: string
     outputLabel?: string
+    outputDescription?: string
     outputTone?: "default" | "dim"
     hideOutputWhenCollapsed?: boolean
 }

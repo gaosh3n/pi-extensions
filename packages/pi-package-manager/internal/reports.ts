@@ -11,6 +11,7 @@ import {
     PACKAGE_MANAGER_WIDGET_KEY,
     type AutoUpdateOutcome,
     type AutoUpdateRecord,
+    type InstallOutcome,
     type PackageManagerReport,
     type PackageStatusSnapshot,
     type WidgetState,
@@ -73,7 +74,10 @@ export function createReportEntryRenderer() {
             if (!expanded && report.hideOutputWhenCollapsed) {
                 box.addChild(
                     new Text(
-                        formatExpandHint(theme, "to expand to see update output."),
+                        formatExpandHint(
+                            theme,
+                            `to expand to see ${report.outputDescription ?? "output"}.`,
+                        ),
                         0,
                         0,
                     ),
@@ -83,10 +87,7 @@ export function createReportEntryRenderer() {
 
                 box.addChild(
                     new Text(
-                        theme.fg(
-                            outputTextTone,
-                            report.outputLabel ?? "Update output:",
-                        ),
+                        theme.fg(outputTextTone, report.outputLabel ?? "Output:"),
                         0,
                         0,
                     ),
@@ -98,7 +99,7 @@ export function createReportEntryRenderer() {
                         new Text(
                             formatExpandHint(
                                 theme,
-                                "to expand to view the full update output.",
+                                `to expand to view the full ${report.outputDescription ?? "output"}.`,
                             ),
                             0,
                             0,
@@ -203,6 +204,43 @@ export function createAutoUpdateResultReport(input: {
         lines,
         lineTone: "dim",
         output: input.output ?? input.record.reason,
+        outputLabel: "Update output:",
+        outputDescription: "update output",
+        outputTone: "dim",
+        hideOutputWhenCollapsed: true,
+    }
+}
+
+export function createInstallResultReport(input: {
+    startedAtUtc: string
+    endedAtUtc: string
+    source: string
+    outcome: InstallOutcome
+    output?: string
+    reason?: string
+}): PackageManagerReport {
+    return {
+        title: PACKAGE_MANAGER_TITLE,
+        headline:
+            input.outcome === "succeeded"
+                ? "Pi package install completed."
+                : "Pi package install failed.",
+        tone: input.outcome === "succeeded" ? "success" : "error",
+        lines: [
+            `Start: ${formatUtcTimestamp(input.startedAtUtc)}`,
+            `End: ${formatUtcTimestamp(input.endedAtUtc)}`,
+            `Result: ${input.outcome}`,
+            `Package source: ${input.source}`,
+            ...(input.outcome === "succeeded"
+                ? ["Run /reload to activate installed package resources."]
+                : []),
+        ],
+        lineTone: "dim",
+        output: input.output ?? input.reason,
+        outputLabel:
+            input.outcome === "succeeded" ? "Install output:" : "Error detail:",
+        outputDescription:
+            input.outcome === "succeeded" ? "install output" : "error detail",
         outputTone: "dim",
         hideOutputWhenCollapsed: true,
     }
@@ -224,6 +262,13 @@ export function createAutomaticUpdateWidgetLines(state: WidgetState): string[] {
         return [
             formatAutomaticUpdateHeadline("in-progress"),
             `Installing ${state.packages} package update${state.packages === 1 ? "" : "s"}...`,
+        ]
+    }
+
+    if (state.mode === "package-installing") {
+        return [
+            "Pi package install in progress.",
+            `Installing package from ${state.source}...`,
         ]
     }
 

@@ -8,6 +8,7 @@
 - a visible progress UI while Pi checks or updates packages
 - `/package-manager status` to see whether updates are available
 - `/package-manager update` to run the update flow on demand
+- `/package-manager install` to install a Pi package from an entered source
 - a final result card in Pi so you can review the latest outcome
 - automatic Pi reload after a successful startup update
 
@@ -44,3 +45,13 @@ Run:
 ```
 
 Pi will run the update flow for you, show live progress, and record the final result in the transcript.
+
+### Install a package
+
+Run:
+
+```text
+/package-manager install
+```
+
+Pi will prompt you for a package source such as `npm:@foo/bar` or `git:github.com/user/repo`, run the native `pi install ...` flow, and show a final result card. After a successful install, run `/reload` to activate the installed package resources.
