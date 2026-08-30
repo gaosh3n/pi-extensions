@@ -1,6 +1,6 @@
 {
     "name": "@gaosh3n/pi-package-manager",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Package Manager for Pi",
     "type": "module",
     "packageManager": "pnpm@11.23.0",
@@ -27,6 +27,7 @@
     },
     "files": [
         "index.ts",
+        "internal/**/*.ts",
         "README.md",
         "LICENSE"
     ],
