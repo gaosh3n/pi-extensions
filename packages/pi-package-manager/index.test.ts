@@ -58,7 +58,9 @@ interface Harness {
         event: { reason: "startup" | "reload" },
         ctx: any,
     ) => Promise<void>
+    sessionShutdownHandler: ((event: unknown, ctx: any) => Promise<void>) | undefined
     commandHandler: (args: string, ctx: any) => Promise<void>
+    replaceSession(): Promise<void>
     ctx: any
 }
 
@@ -82,7 +84,9 @@ function createHarness(options?: {
     let commandDescription: Harness["commandDescription"]
     let getArgumentCompletions: Harness["getArgumentCompletions"]
     let sessionStartHandler: Harness["sessionStartHandler"] | undefined
+    let sessionShutdownHandler: Harness["sessionShutdownHandler"]
     let commandHandler: Harness["commandHandler"] | undefined
+    let sessionReplaced = false
 
     const nowIsoValues = options?.nowIsoValues ?? [
         "2025-08-27T13:42:01.000Z",
@@ -105,6 +109,14 @@ function createHarness(options?: {
         runNativeUninstall: async () =>
             createExecResult({ code: 0, stdout: "", stderr: "" }),
         ...options?.deps,
+    }
+
+    const assertSessionActive = () => {
+        if (sessionReplaced) {
+            throw new Error(
+                "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+            )
+        }
     }
 
     const ctx = {
@@ -130,23 +142,30 @@ function createHarness(options?: {
         fork: async () => ({ cancelled: false }),
         navigateTree: async () => ({ cancelled: false }),
         switchSession: async () => ({ cancelled: false }),
-        reload: async () => {},
+        reload: async () => {
+            assertSessionActive()
+        },
         ui: {
             async custom(_factory: unknown, uiOptions?: { overlay?: boolean }) {
+                assertSessionActive()
                 customCalls.push({ overlay: uiOptions?.overlay })
                 return options?.customReturnValue
             },
             async input(title: string, placeholder?: string) {
+                assertSessionActive()
                 inputCalls.push({ title, placeholder })
                 return options?.inputReturnValue
             },
             notify(message: string, level: string) {
+                assertSessionActive()
                 notifications.push({ message, level })
             },
             setStatus(key: string, text: string | undefined) {
+                assertSessionActive()
                 statuses.push({ key, text })
             },
             setWidget(key: string, content: unknown) {
+                assertSessionActive()
                 widgets.push({ key, content })
             },
         },
@@ -161,8 +180,13 @@ function createHarness(options?: {
                 if (event === "session_start") {
                     sessionStartHandler = handler
                 }
+                if (event === "session_shutdown") {
+                    sessionShutdownHandler =
+                        handler as Harness["sessionShutdownHandler"]
+                }
             },
             sendUserMessage(message: string, sendOptions: unknown) {
+                assertSessionActive()
                 sentUserMessages.push({ message, options: sendOptions })
             },
             registerCommand(
@@ -180,6 +204,7 @@ function createHarness(options?: {
                 }
             },
             appendEntry(type: string, data?: unknown) {
+                assertSessionActive()
                 entries.push({ type, data })
                 sessionEntries.push({ type: "custom", customType: type, data })
             },
@@ -206,7 +231,12 @@ function createHarness(options?: {
         widgets,
         reportRenderer,
         sessionStartHandler,
+        sessionShutdownHandler,
         commandHandler,
+        async replaceSession() {
+            sessionReplaced = true
+            await sessionShutdownHandler?.({ reason: "resume" }, ctx)
+        },
         ctx,
     }
 }
@@ -1200,6 +1230,185 @@ test("automatic startup update reports no-update skip as a final report", async 
             outputTone: "dim",
             hideOutputWhenCollapsed: true,
         },
+    })
+})
+
+test("automatic startup update abandons stale session replacement while native update is in progress", async () => {
+    let resolveUpdate: ((value: ExecResult) => void) | undefined
+
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => ["pi-package-manager"],
+            runNativeUpdate: async () =>
+                new Promise((resolve) => {
+                    resolveUpdate = resolve
+                }),
+        },
+    })
+
+    const pending = harness.commandHandler("update --startup", harness.ctx)
+    await Promise.resolve()
+    await harness.replaceSession()
+    resolveUpdate?.(createExecResult({ code: 0, stdout: "updated", stderr: "" }))
+
+    await assert.doesNotReject(() => pending)
+    assert.deepEqual(harness.entries, [])
+    assert.deepEqual(harness.notifications, [])
+    assert.deepEqual(harness.widgets, [
+        {
+            key: "pi-package-manager",
+            content: harness.widgets[0]?.content,
+        },
+        {
+            key: "pi-package-manager",
+            content: harness.widgets[1]?.content,
+        },
+    ])
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+    assert.equal(typeof harness.widgets[1]?.content, "function")
+})
+
+test("automatic startup update abandons stale session replacement during reload countdown", async () => {
+    let sleepResolver: (() => void) | undefined
+
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => ["pi-package-manager"],
+            runNativeUpdate: async () =>
+                createExecResult({ code: 0, stdout: "updated", stderr: "" }),
+            sleep: async () =>
+                new Promise<void>((resolve) => {
+                    sleepResolver = resolve
+                }),
+        },
+    })
+    let reloads = 0
+    harness.ctx.reload = async () => {
+        reloads += 1
+    }
+
+    const pending = harness.commandHandler("update --startup", harness.ctx)
+    for (let attempt = 0; attempt < 5; attempt++) {
+        if (sleepResolver) {
+            break
+        }
+        await Promise.resolve()
+    }
+    assert.ok(sleepResolver)
+    await harness.replaceSession()
+    sleepResolver()
+
+    await assert.doesNotReject(() => pending)
+    assert.equal(reloads, 0)
+    assert.equal(harness.entries[0]?.type, AUTO_UPDATE_RECORD_ENTRY_TYPE)
+    assert.equal(harness.entries[1]?.type, REPORT_ENTRY_TYPE)
+    assert.equal(typeof harness.widgets.at(-1)?.content, "function")
+})
+
+test("status abandons stale session replacement while checking updates", async () => {
+    let resolveUpdates: ((value: string[]) => void) | undefined
+
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () =>
+                new Promise((resolve) => {
+                    resolveUpdates = resolve
+                }),
+        },
+    })
+
+    const pending = harness.commandHandler("status", harness.ctx)
+    await harness.replaceSession()
+    resolveUpdates?.(["alpha"])
+
+    await assert.doesNotReject(() => pending)
+    assert.deepEqual(harness.entries, [])
+    assert.deepEqual(harness.widgets, [
+        {
+            key: "pi-package-manager",
+            content: harness.widgets[0]?.content,
+        },
+    ])
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+})
+
+test("install abandons stale session replacement while native install is in progress", async () => {
+    let resolveInstall: ((value: ExecResult) => void) | undefined
+
+    const harness = createHarness({
+        inputReturnValue: "npm:@gaosh3n/pi-package-manager",
+        deps: {
+            runNativeInstall: async () =>
+                new Promise((resolve) => {
+                    resolveInstall = resolve
+                }),
+        },
+    })
+
+    const pending = harness.commandHandler("install", harness.ctx)
+    await Promise.resolve()
+    await harness.replaceSession()
+    resolveInstall?.(createExecResult({ code: 0, stdout: "installed", stderr: "" }))
+
+    await assert.doesNotReject(() => pending)
+    assert.deepEqual(harness.entries, [])
+    assert.equal(harness.widgets.length, 1)
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+})
+
+test("uninstall abandons stale session replacement while native uninstall is in progress", async () => {
+    let resolveUninstall: ((value: ExecResult) => void) | undefined
+
+    const harness = createHarness({
+        deps: {
+            listConfiguredPackages: async () => [
+                {
+                    source: "npm:@gaosh3n/pi-package-manager",
+                    scope: "user",
+                    filtered: false,
+                },
+            ],
+            runNativeUninstall: async () =>
+                new Promise((resolve) => {
+                    resolveUninstall = resolve
+                }),
+        },
+        customReturnValue: ["npm:@gaosh3n/pi-package-manager"],
+    })
+
+    const pending = harness.commandHandler("uninstall", harness.ctx)
+    for (let attempt = 0; attempt < 5; attempt++) {
+        if (resolveUninstall) {
+            break
+        }
+        await Promise.resolve()
+    }
+    assert.ok(resolveUninstall)
+    await harness.replaceSession()
+    resolveUninstall(createExecResult({ code: 0, stdout: "removed", stderr: "" }))
+
+    await assert.doesNotReject(() => pending)
+    assert.deepEqual(harness.entries, [])
+    assert.equal(harness.widgets.length, 1)
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+})
+
+test("status clears its widget after completion", async () => {
+    const harness = createHarness({
+        deps: {
+            checkForAvailableUpdates: async () => ["alpha"],
+        },
+    })
+
+    await harness.commandHandler("status", harness.ctx)
+
+    assert.equal(harness.entries.length, 1)
+    assert.equal(harness.widgets.length, 2)
+    assert.equal(harness.widgets[0]?.key, "pi-package-manager")
+    assert.equal(typeof harness.widgets[0]?.content, "function")
+    assert.deepEqual(harness.widgets[1], {
+        key: "pi-package-manager",
+        content: undefined,
     })
 })
 

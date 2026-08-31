@@ -36,81 +36,7 @@ export function createReportEntryRenderer() {
             return undefined
         }
 
-        const toneColor =
-            report.tone === "error"
-                ? "error"
-                : report.tone === "warning"
-                  ? "warning"
-                  : report.tone === "success"
-                    ? "success"
-                    : "accent"
-        const lineTextTone = report.lineTone === "dim" ? "dim" : "customMessageText"
-        const outputTextTone = report.outputTone === "dim" ? "dim" : lineTextTone
-
-        const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text))
-
-        box.addChild(
-            new Text(
-                `${theme.fg(toneColor, "●")} ${theme.bold(theme.fg("customMessageLabel", report.title))}`,
-                0,
-                0,
-            ),
-        )
-
-        if (report.headline) {
-            box.addChild(new Text(theme.fg("text", report.headline), 0, 0))
-        }
-
-        if (report.lines.length > 0) {
-            box.addChild(
-                new Text(
-                    report.lines.map((line) => theme.fg(lineTextTone, line)).join("\n"),
-                    0,
-                    0,
-                ),
-            )
-        }
-
-        if (report.output?.trim()) {
-            if (!expanded && report.hideOutputWhenCollapsed) {
-                box.addChild(
-                    new Text(
-                        formatExpandHint(
-                            theme,
-                            `to expand to see ${report.outputDescription ?? "output"}.`,
-                        ),
-                        0,
-                        0,
-                    ),
-                )
-            } else {
-                const { text, truncated } = formatReportOutput(report.output, expanded)
-
-                box.addChild(
-                    new Text(
-                        theme.fg(outputTextTone, report.outputLabel ?? "Output:"),
-                        0,
-                        0,
-                    ),
-                )
-                box.addChild(new Text(theme.fg(outputTextTone, text), 0, 0))
-
-                if (truncated) {
-                    box.addChild(
-                        new Text(
-                            formatExpandHint(
-                                theme,
-                                `to expand to view the full ${report.outputDescription ?? "output"}.`,
-                            ),
-                            0,
-                            0,
-                        ),
-                    )
-                }
-            }
-        }
-
-        return box
+        return createReportBox(report, theme, { expanded })
     }
 }
 
@@ -343,39 +269,12 @@ export function setPackageManagerWidget(
 
     ctx.ui.setWidget(
         PACKAGE_MANAGER_WIDGET_KEY,
-        (_tui, theme) => {
-            const background =
-                state.mode === "countdown"
-                    ? (text: string) => theme.bg("toolSuccessBg", text)
-                    : (text: string) => theme.bg("toolPendingBg", text)
-            const box = new Box(1, 1, background)
-            const titleColor = state.mode === "countdown" ? "success" : "accent"
-            const bodyLines = createAutomaticUpdateWidgetLines(state)
-
-            box.addChild(
-                new Text(
-                    `${theme.fg(titleColor, "●")} ${theme.bold(theme.fg("customMessageLabel", PACKAGE_MANAGER_TITLE))}`,
-                    0,
-                    0,
-                ),
-            )
-            box.addChild(
-                new Text(
-                    bodyLines
-                        .map((line, index) =>
-                            theme.fg(
-                                index === bodyLines.length - 1 ? "dim" : "text",
-                                line,
-                            ),
-                        )
-                        .join("\n"),
-                    0,
-                    0,
-                ),
-            )
-
-            return box
-        },
+        (_tui, theme) =>
+            createStatusBox(theme, createAutomaticUpdateWidgetLines(state), {
+                titleColor: state.mode === "countdown" ? "success" : "accent",
+                background:
+                    state.mode === "countdown" ? "toolSuccessBg" : "toolPendingBg",
+            }),
         { placement: "aboveEditor" },
     )
 }
@@ -426,6 +325,115 @@ function formatAutomaticUpdateHeadline(
               : state
 
     return `Pi package(s) update ${suffix}.`
+}
+
+function createReportBox(
+    report: PackageManagerReport,
+    theme: ThemeLike,
+    options: { expanded: boolean },
+): Box {
+    const toneColor =
+        report.tone === "error"
+            ? "error"
+            : report.tone === "warning"
+              ? "warning"
+              : report.tone === "success"
+                ? "success"
+                : "accent"
+    const lineTextTone = report.lineTone === "dim" ? "dim" : "customMessageText"
+    const outputTextTone = report.outputTone === "dim" ? "dim" : lineTextTone
+    const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text))
+
+    box.addChild(
+        new Text(
+            `${theme.fg(toneColor, "●")} ${theme.bold(theme.fg("customMessageLabel", report.title))}`,
+            0,
+            0,
+        ),
+    )
+
+    if (report.headline) {
+        box.addChild(new Text(theme.fg("text", report.headline), 0, 0))
+    }
+
+    if (report.lines.length > 0) {
+        box.addChild(
+            new Text(
+                report.lines.map((line) => theme.fg(lineTextTone, line)).join("\n"),
+                0,
+                0,
+            ),
+        )
+    }
+
+    if (!report.output?.trim()) {
+        return box
+    }
+
+    if (!options.expanded && report.hideOutputWhenCollapsed) {
+        box.addChild(
+            new Text(
+                formatExpandHint(
+                    theme,
+                    `to expand to see ${report.outputDescription ?? "output"}.`,
+                ),
+                0,
+                0,
+            ),
+        )
+        return box
+    }
+
+    const { text, truncated } = formatReportOutput(report.output, options.expanded)
+
+    box.addChild(
+        new Text(theme.fg(outputTextTone, report.outputLabel ?? "Output:"), 0, 0),
+    )
+    box.addChild(new Text(theme.fg(outputTextTone, text), 0, 0))
+
+    if (truncated) {
+        box.addChild(
+            new Text(
+                formatExpandHint(
+                    theme,
+                    `to expand to view the full ${report.outputDescription ?? "output"}.`,
+                ),
+                0,
+                0,
+            ),
+        )
+    }
+
+    return box
+}
+
+function createStatusBox(
+    theme: ThemeLike,
+    bodyLines: string[],
+    options: { titleColor: string; background: string },
+): Box {
+    const box = new Box(1, 1, (text: string) => theme.bg(options.background, text))
+
+    box.addChild(
+        new Text(
+            `${theme.fg(options.titleColor, "●")} ${theme.bold(theme.fg("customMessageLabel", PACKAGE_MANAGER_TITLE))}`,
+            0,
+            0,
+        ),
+    )
+    box.addChild(
+        new Text(
+            bodyLines
+                .map((line, index) =>
+                    theme.fg(index === bodyLines.length - 1 ? "dim" : "text", line),
+                )
+                .join("\n"),
+            0,
+            0,
+        ),
+    )
+
+    return box
 }
 
 function formatExpandHint(theme: ThemeLike, description: string): string {

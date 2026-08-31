@@ -29,8 +29,11 @@ export function createPackageManagerController(
     pi: Pick<ExtensionAPI, "appendEntry" | "sendUserMessage" | "exec">,
     deps: PackageManagerDeps = defaultPackageManagerDeps,
 ) {
+    let sessionIsActive = true
+
     return {
         onSessionStart,
+        onSessionShutdown,
         handleStatus,
         handleUpdate,
         handleInstall,
@@ -41,6 +44,8 @@ export function createPackageManagerController(
         event: Pick<SessionStartEvent, "reason">,
         _ctx: ExtensionContext,
     ): Promise<void> {
+        sessionIsActive = true
+
         if (!shouldAutoUpdateOnSessionStart(event)) {
             return
         }
@@ -50,6 +55,10 @@ export function createPackageManagerController(
         })
     }
 
+    async function onSessionShutdown(): Promise<void> {
+        sessionIsActive = false
+    }
+
     async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
         const lastAutoUpdate = getLastAutoUpdateRecord(ctx.sessionManager.getEntries())
 
@@ -57,26 +66,37 @@ export function createPackageManagerController(
 
         try {
             const availableUpdates = await deps.checkForAvailableUpdates(ctx)
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createStatusReport({
+
+            if (!isSessionActive()) {
+                return
+            }
+
+            appendReport({
+                type: REPORT_ENTRY_TYPE,
+                report: createStatusReport({
                     availableUpdates,
                     lastAutoUpdate,
                 }),
-            )
+            })
         } catch (error) {
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createStatusErrorReport(
+            if (!isSessionActive()) {
+                return
+            }
+
+            appendReport({
+                type: REPORT_ENTRY_TYPE,
+                report: createStatusErrorReport(
                     {
                         availableUpdates: [],
                         lastAutoUpdate,
                     },
                     getErrorMessage(error),
                 ),
-            )
+            })
         } finally {
-            clearPackageManagerWidget(ctx)
+            if (isSessionActive()) {
+                clearPackageManagerWidget(ctx)
+            }
         }
     }
 
@@ -97,6 +117,10 @@ export function createPackageManagerController(
 
             const availableUpdates = await deps.checkForAvailableUpdates(ctx)
 
+            if (!isSessionActive()) {
+                return
+            }
+
             if (availableUpdates.length === 0) {
                 appendSkippedResult(startedAtUtc, "No package updates are available.")
                 return
@@ -108,6 +132,11 @@ export function createPackageManagerController(
             })
 
             const result = await deps.runNativeUpdate(pi, ctx)
+
+            if (!isSessionActive()) {
+                return
+            }
+
             const output = getExecDisplayOutput(result)
 
             if (result.code === 0) {
@@ -117,17 +146,18 @@ export function createPackageManagerController(
                     outcome: "succeeded",
                     packagesUpdated: availableUpdates.length,
                 })
-
-                appendAutoUpdateRecordAndReport(
-                    pi,
+                const report = createAutoUpdateResultReport({
                     record,
-                    createAutoUpdateResultReport({
-                        record,
-                        output,
-                        reloadAfterSeconds: RELOAD_COUNTDOWN_SECONDS,
-                    }),
-                )
-                await runReloadCountdown(ctx)
+                    output,
+                    reloadAfterSeconds: RELOAD_COUNTDOWN_SECONDS,
+                })
+
+                appendAutoUpdateRecordAndReport(pi, record, report)
+
+                if (!(await runReloadCountdown(ctx))) {
+                    return
+                }
+
                 clearPackageManagerWidget(ctx)
                 shouldClearWidget = false
                 await ctx.reload()
@@ -141,14 +171,15 @@ export function createPackageManagerController(
                 packagesUpdated: 0,
                 reason: getExecFailureDetail(result, "Package update command failed."),
             })
+            const report = createAutoUpdateResultReport({ record, output })
 
-            appendAutoUpdateRecordAndReport(
-                pi,
-                record,
-                createAutoUpdateResultReport({ record, output }),
-            )
+            appendAutoUpdateRecordAndReport(pi, record, report)
             notifyStartupFailure(ctx, options.startupTriggered)
         } catch (error) {
+            if (!isSessionActive()) {
+                return
+            }
+
             const record = createAutoUpdateRecord({
                 startedAtUtc,
                 endedAtUtc: deps.nowIso(),
@@ -156,15 +187,12 @@ export function createPackageManagerController(
                 packagesUpdated: 0,
                 reason: getErrorMessage(error),
             })
+            const report = createAutoUpdateResultReport({ record })
 
-            appendAutoUpdateRecordAndReport(
-                pi,
-                record,
-                createAutoUpdateResultReport({ record }),
-            )
+            appendAutoUpdateRecordAndReport(pi, record, report)
             notifyStartupFailure(ctx, options.startupTriggered)
         } finally {
-            if (shouldClearWidget) {
+            if (shouldClearWidget && isSessionActive()) {
                 clearPackageManagerWidget(ctx)
             }
         }
@@ -186,7 +214,7 @@ export function createPackageManagerController(
             )
         )?.trim()
 
-        if (source === undefined) {
+        if (!isSessionActive() || source === undefined) {
             return
         }
 
@@ -200,49 +228,47 @@ export function createPackageManagerController(
 
         try {
             const result = await deps.runNativeInstall(pi, ctx, source)
-            const output = getExecDisplayOutput(result)
 
-            if (result.code === 0) {
-                pi.appendEntry(
-                    REPORT_ENTRY_TYPE,
-                    createInstallResultReport({
-                        startedAtUtc,
-                        endedAtUtc: deps.nowIso(),
-                        source,
-                        outcome: "succeeded",
-                        output,
-                    }),
-                )
+            if (!isSessionActive()) {
                 return
             }
 
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createInstallResultReport({
-                    startedAtUtc,
-                    endedAtUtc: deps.nowIso(),
-                    source,
-                    outcome: "failed",
-                    output,
-                    reason: getExecFailureDetail(
-                        result,
-                        "Package install command failed.",
-                    ),
-                }),
-            )
+            const output = getExecDisplayOutput(result)
+            const report = createInstallResultReport({
+                startedAtUtc,
+                endedAtUtc: deps.nowIso(),
+                source,
+                outcome: result.code === 0 ? "succeeded" : "failed",
+                output,
+                reason:
+                    result.code === 0
+                        ? undefined
+                        : getExecFailureDetail(
+                              result,
+                              "Package install command failed.",
+                          ),
+            })
+
+            appendReport({ type: REPORT_ENTRY_TYPE, report })
         } catch (error) {
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createInstallResultReport({
+            if (!isSessionActive()) {
+                return
+            }
+
+            appendReport({
+                type: REPORT_ENTRY_TYPE,
+                report: createInstallResultReport({
                     startedAtUtc,
                     endedAtUtc: deps.nowIso(),
                     source,
                     outcome: "failed",
                     reason: getErrorMessage(error),
                 }),
-            )
+            })
         } finally {
-            clearPackageManagerWidget(ctx)
+            if (isSessionActive()) {
+                clearPackageManagerWidget(ctx)
+            }
         }
     }
 
@@ -254,6 +280,10 @@ export function createPackageManagerController(
 
         const packages = await deps.listConfiguredPackages(ctx)
 
+        if (!isSessionActive()) {
+            return
+        }
+
         if (packages.length === 0) {
             ctx.ui.notify("No Pi packages are available to uninstall.", "info")
             return
@@ -261,7 +291,7 @@ export function createPackageManagerController(
 
         const selectedSources = await promptForPackagesToUninstall(ctx, packages)
 
-        if (selectedSources === undefined) {
+        if (!isSessionActive() || selectedSources === undefined) {
             return
         }
 
@@ -295,6 +325,11 @@ export function createPackageManagerController(
                 })
 
                 const result = await deps.runNativeUninstall(pi, ctx, source)
+
+                if (!isSessionActive()) {
+                    return
+                }
+
                 const output = getExecDisplayOutput(result)
 
                 if (result.code === 0) {
@@ -311,9 +346,9 @@ export function createPackageManagerController(
                 )
             }
 
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createUninstallResultReport({
+            appendReport({
+                type: REPORT_ENTRY_TYPE,
+                report: createUninstallResultReport({
                     startedAtUtc,
                     endedAtUtc: deps.nowIso(),
                     sources,
@@ -334,8 +369,12 @@ export function createPackageManagerController(
                             ? `Failed to uninstall ${failedSources[0]}.`
                             : undefined,
                 }),
-            )
+            })
         } catch (error) {
+            if (!isSessionActive()) {
+                return
+            }
+
             const failedSource = sources[succeededSources.length]
             const errorMessage = getErrorMessage(error)
 
@@ -346,9 +385,9 @@ export function createPackageManagerController(
             outputSections.push(
                 failedSource ? `[${failedSource}]\n${errorMessage}` : errorMessage,
             )
-            pi.appendEntry(
-                REPORT_ENTRY_TYPE,
-                createUninstallResultReport({
+            appendReport({
+                type: REPORT_ENTRY_TYPE,
+                report: createUninstallResultReport({
                     startedAtUtc,
                     endedAtUtc: deps.nowIso(),
                     sources,
@@ -358,9 +397,11 @@ export function createPackageManagerController(
                     output: outputSections.join("\n\n"),
                     reason: errorMessage,
                 }),
-            )
+            })
         } finally {
-            clearPackageManagerWidget(ctx)
+            if (isSessionActive()) {
+                clearPackageManagerWidget(ctx)
+            }
         }
     }
 
@@ -372,26 +413,44 @@ export function createPackageManagerController(
             packagesUpdated: 0,
             reason,
         })
+        const report = createAutoUpdateResultReport({ record })
 
-        appendAutoUpdateRecordAndReport(
-            pi,
-            record,
-            createAutoUpdateResultReport({ record }),
-        )
+        appendAutoUpdateRecordAndReport(pi, record, report)
+    }
+
+    function appendReport(entry: {
+        type: string
+        report: ReturnType<typeof createStatusReport>
+    }): void {
+        pi.appendEntry(entry.type, entry.report)
+    }
+
+    function isSessionActive(): boolean {
+        return sessionIsActive
     }
 
     async function runReloadCountdown(
         ctx: ExtensionContext,
         seconds = RELOAD_COUNTDOWN_SECONDS,
-    ): Promise<void> {
+    ): Promise<boolean> {
         for (let remaining = seconds; remaining >= 1; remaining--) {
+            if (!isSessionActive()) {
+                return false
+            }
+
             setPackageManagerWidget(ctx, {
                 mode: "countdown",
                 secondsRemaining: remaining,
             })
 
             await deps.sleep(1000)
+
+            if (!isSessionActive()) {
+                return false
+            }
         }
+
+        return true
     }
 }
 
