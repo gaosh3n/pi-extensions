@@ -49,6 +49,7 @@ export default function initPackageManager(
     )
 
     pi.on("session_start", controller.onSessionStart)
+    pi.on("session_shutdown", controller.onSessionShutdown)
 
     pi.registerCommand("package-manager", {
         description:
