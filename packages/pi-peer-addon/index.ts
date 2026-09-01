@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto"
-import { basename } from "node:path"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { readdir, readFile, rm } from "node:fs/promises"
 
 import {
     DynamicBorder,
@@ -20,31 +22,38 @@ import {
 
 export const PEER_ADDON_COMMAND = "peer-addon"
 export const LIST_PEERS_SUBCOMMAND = "list-peers"
+export const CLEAN_UP_PEERS_SUBCOMMAND = "clean-up-peers"
 
-const MISSING_PI_PEER_MESSAGE =
-    "pi-peer-addon requires the pi-peer /peers command. Install and load @shift-labs/pi-peer, then retry."
-const PEERS_CAPTURE_TIMEOUT_MS = 2_000
-
-type AvailableCommand = ReturnType<ExtensionAPI["getCommands"]>[number]
+const STALE_AFTER_MS = 45_000
 
 type PeerTabKey = "current" | "other"
 
 type PeerLoadState =
     | { kind: "loading" }
-    | { kind: "ready"; pages: PeerPages; peersCommandName: string }
+    | { kind: "ready"; pages: PeerPages }
     | { kind: "error"; message: string }
 
-export interface ParsedPeerRow {
-    sourceName: string
+type CleanupLoadState =
+    | { kind: "loading" }
+    | { kind: "ready"; pages: CleanupMailboxPages }
+    | { kind: "error"; message: string }
+
+export interface PeerRecordFile {
+    id: string
+    name: string
     cwd: string
-    status: string
+    sessionId: string
+    state: string
+    beatAt: number
+    pid?: number
 }
 
 export interface PeerDisplayRow {
+    id: string
     label: string
-    status: string
     cwd: string
-    sourceName: string
+    state: string
+    sessionId: string
     isMe: boolean
 }
 
@@ -53,211 +62,264 @@ export interface PeerPages {
     other: PeerDisplayRow[]
 }
 
+type MailboxPresence = "live" | "stalled" | "offline"
+
+export interface CleanupMailboxRow extends PeerDisplayRow {
+    presence: MailboxPresence
+    letterCount: number
+}
+
+export interface CleanupMailboxPages {
+    current: CleanupMailboxRow[]
+    other: CleanupMailboxRow[]
+}
+
+interface CleanupMailboxResult {
+    cleanedIds: string[]
+    skipped: Array<{ id: string; reason: string }>
+}
+
 interface PeerSelectItem extends SelectItem {
     peer?: PeerDisplayRow
+    mailbox?: CleanupMailboxRow
 }
 
 function normalizeSubcommand(args: string): string {
     return args.trim()
 }
 
-function formatDirName(cwd: string): string {
-    return basename(cwd) || "pi"
+function defaultPeersDir(): string {
+    return process.env.PI_PEER_DIR ?? join(homedir(), ".pi", "agent", "peers")
 }
 
-function stablePrefix(seed: string): string {
-    return createHash("sha256").update(seed).digest("hex").slice(0, 4)
+function mailboxId(cwd: string, sessionId: string): string {
+    return createHash("sha256")
+        .update(`${cwd}\0${sessionId}`)
+        .digest("hex")
+        .slice(0, 12)
 }
 
-function extractSourcePrefix(sourceName: string): string | undefined {
-    const match = /#([A-Za-z0-9]{4,})$/.exec(sourceName.trim())
-    return match?.[1]?.slice(0, 4)
+function mailboxRecordPath(peersDir: string, id: string): string {
+    return join(peersDir, `${id}.json`)
 }
 
-export function createFriendlyPeerName(
-    cwd: string,
-    sourceName: string,
-    fallbackSeed?: string,
-): string {
-    const dirName = formatDirName(cwd)
-    const prefix =
-        extractSourcePrefix(sourceName) ??
-        stablePrefix(fallbackSeed ?? `${sourceName}\0${cwd}`)
-    return `${dirName}#${prefix}`
+function inboxPath(peersDir: string, id: string): string {
+    return join(peersDir, `${id}.inbox`)
 }
 
-export function parsePeersListing(listing: string): ParsedPeerRow[] {
-    const trimmed = listing.trim()
-    if (trimmed.length === 0) return []
-    if (trimmed.startsWith("No other pi sessions are known.")) return []
+function parsePeerRecordFile(value: unknown): PeerRecordFile | undefined {
+    if (!value || typeof value !== "object") return undefined
 
-    const rows: ParsedPeerRow[] = []
-
-    for (const line of listing.split("\n")) {
-        const match = /^\s*(.+?)\s{2,}(.*?)\s{2,}\[([^\]]+)\]\s*$/.exec(line)
-        if (!match) continue
-
-        rows.push({
-            sourceName: match[1]!.trim(),
-            cwd: match[2]!.trim(),
-            status: match[3]!.trim(),
-        })
-    }
-
-    return rows
-}
-
-function createSelfPeerName(cwd: string, currentSessionId?: string): string {
-    const dirName = formatDirName(cwd)
-    const prefix = (currentSessionId?.trim() || stablePrefix(cwd)).slice(0, 4)
-    return `${dirName}#${prefix}`
-}
-
-export function buildPeerPages(options: {
-    listing: string
-    currentCwd: string
-    currentSessionId?: string
-    currentStatus: string
-}): PeerPages {
-    const peers = parsePeersListing(options.listing).map((row) => ({
-        label: createFriendlyPeerName(row.cwd, row.sourceName),
-        status: row.status,
-        cwd: row.cwd,
-        sourceName: row.sourceName,
-        isMe: false,
-    }))
-
-    const me: PeerDisplayRow = {
-        label: createSelfPeerName(options.currentCwd, options.currentSessionId),
-        status: options.currentStatus,
-        cwd: options.currentCwd,
-        sourceName: "[me]",
-        isMe: true,
+    const record = value as Record<string, unknown>
+    if (
+        typeof record.id !== "string" ||
+        typeof record.name !== "string" ||
+        typeof record.cwd !== "string" ||
+        typeof record.sessionId !== "string" ||
+        typeof record.state !== "string" ||
+        typeof record.beatAt !== "number"
+    ) {
+        return undefined
     }
 
     return {
-        current: [me, ...peers.filter((peer) => peer.cwd === options.currentCwd)],
-        other: peers.filter((peer) => peer.cwd !== options.currentCwd),
+        id: record.id,
+        name: record.name,
+        cwd: record.cwd,
+        sessionId: record.sessionId,
+        state: record.state,
+        beatAt: record.beatAt,
+        pid: typeof record.pid === "number" ? record.pid : undefined,
     }
 }
 
-function isPeersCommandName(name: string): boolean {
-    return /^peers(?::\d+)?$/.test(name)
+function peerLabel(record: Pick<PeerRecordFile, "id" | "name">): string {
+    return `${record.name}#${record.id.slice(0, 4)}`
 }
 
-function hasPiPeerProvenance(command: AvailableCommand): boolean {
-    if (command.source !== "extension") return false
-    const sourcePath = command.sourceInfo.path.replaceAll("\\", "/")
-    return (
-        sourcePath.includes("@shift-labs/pi-peer") ||
-        /(^|\/)pi-peer(\/|$)/.test(sourcePath)
-    )
-}
-
-export function resolvePeersCommand(
-    commands: readonly AvailableCommand[],
-): AvailableCommand | undefined {
-    const piPeerMatches = commands.filter(
-        (command) => isPeersCommandName(command.name) && hasPiPeerProvenance(command),
-    )
-
-    return piPeerMatches.find((command) => command.name === "peers") ?? piPeerMatches[0]
-}
-
-/**
- * Temporary adapter for T2.
- *
- * Pi exposes slash-command dispatch, but not command-to-command return values.
- * The runtime-level pi.sendUserMessage(...) helper is fire-and-forget, so we
- * cannot await nested /peers completion directly. Instead we temporarily wrap
- * the shared ui.notify surface, trigger /peers, and wait for the single info
- * notification that pi-peer currently emits when its survey completes.
- *
- * This is intentionally narrow and defensive:
- * - prerequisite check happens before invocation
- * - notify is wrapped only around the nested /peers observation window
- * - non-info notifications are forwarded immediately
- * - we fail closed unless exactly one info notification is observed
- */
-async function capturePeersListing(
-    pi: ExtensionAPI,
-    ctx: ExtensionCommandContext,
-    peersCommandName: string,
-): Promise<string> {
-    const ui = ctx.ui as typeof ctx.ui & {
-        notify: (message: string, level?: "info" | "warning" | "error") => void
+function peerDisplayRowFromRecord(
+    record: PeerRecordFile,
+    currentMailboxId?: string,
+): PeerDisplayRow {
+    return {
+        id: record.id,
+        label: peerLabel(record),
+        cwd: record.cwd,
+        state: record.state,
+        sessionId: record.sessionId,
+        isMe: record.id === currentMailboxId,
     }
-    const originalNotify = ui.notify
-    const captured: Array<{ message: string; level?: "info" | "warning" | "error" }> =
-        []
+}
 
-    return await new Promise<string>((resolve, reject) => {
-        let finished = false
-        let settleTimer: ReturnType<typeof setTimeout> | undefined
-        let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+function sortPeerRows<T extends PeerDisplayRow>(
+    rows: T[],
+    currentCwd: string,
+): {
+    current: T[]
+    other: T[]
+} {
+    const current = rows.filter((row) => row.cwd === currentCwd)
+    const other = rows.filter((row) => row.cwd !== currentCwd)
+    current.sort(
+        (left, right) =>
+            Number(right.isMe) - Number(left.isMe) ||
+            left.label.localeCompare(right.label),
+    )
+    other.sort((left, right) => left.label.localeCompare(right.label))
+    return { current, other }
+}
 
-        const finish = (callback: () => void) => {
-            if (finished) return
-            finished = true
-            if (settleTimer) clearTimeout(settleTimer)
-            if (timeoutTimer) clearTimeout(timeoutTimer)
-            ui.notify = originalNotify
-            callback()
+async function loadPeerRecordFiles(peersDir: string): Promise<PeerRecordFile[]> {
+    let entryNames: string[]
+    try {
+        entryNames = await readdir(peersDir)
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return []
         }
+        throw error
+    }
 
-        const getInfoMessages = () => captured.filter((entry) => entry.level === "info")
+    const records: PeerRecordFile[] = []
+    for (const entryName of entryNames.sort()) {
+        if (!entryName.endsWith(".json")) continue
 
-        const failForObservedCount = () => {
-            const infoMessages = getInfoMessages()
-            finish(() => {
-                reject(
-                    new Error(
-                        `Expected exactly one info notification from /${peersCommandName}, received ${infoMessages.length}.`,
-                    ),
-                )
-            })
+        const raw = await readFile(join(peersDir, entryName), "utf8")
+        const record = parsePeerRecordFile(JSON.parse(raw))
+        if (record) {
+            records.push(record)
         }
+    }
 
-        const scheduleSuccessCheck = () => {
-            if (settleTimer) return
-            settleTimer = setTimeout(() => {
-                const infoMessages = getInfoMessages()
-                if (infoMessages.length !== 1) {
-                    failForObservedCount()
-                    return
-                }
+    return records
+}
 
-                finish(() => resolve(infoMessages[0]!.message))
-            }, 0)
+async function loadPeerPages(options: {
+    peersDir?: string
+    currentCwd: string
+    currentSessionId?: string
+}): Promise<PeerPages> {
+    const peersDir = options.peersDir ?? defaultPeersDir()
+    const currentMailboxId = options.currentSessionId
+        ? mailboxId(options.currentCwd, options.currentSessionId)
+        : undefined
+    const rows = (await loadPeerRecordFiles(peersDir)).map((record) =>
+        peerDisplayRowFromRecord(record, currentMailboxId),
+    )
+    return sortPeerRows(rows, options.currentCwd)
+}
+
+function pidAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0)
+        return true
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EPERM"
+    }
+}
+
+function mailboxPresence(record: PeerRecordFile, now = Date.now()): MailboxPresence {
+    if (record.pid === undefined) return "offline"
+    if (!pidAlive(record.pid)) return "offline"
+    return now - record.beatAt > STALE_AFTER_MS ? "stalled" : "live"
+}
+
+async function countInboxLetters(path: string): Promise<number> {
+    try {
+        const entries = await readdir(path)
+        return entries.length
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return 0
         }
+        throw error
+    }
+}
 
-        ui.notify = (message: string, level?: "info" | "warning" | "error") => {
-            captured.push({ message, level })
-            if (level !== "info") {
-                originalNotify(message, level)
-                return
-            }
+async function loadCleanupMailboxPages(options: {
+    peersDir?: string
+    currentCwd: string
+    currentSessionId?: string
+}): Promise<CleanupMailboxPages> {
+    const peersDir = options.peersDir ?? defaultPeersDir()
+    const currentMailboxId = options.currentSessionId
+        ? mailboxId(options.currentCwd, options.currentSessionId)
+        : undefined
+    const rows = await Promise.all(
+        (await loadPeerRecordFiles(peersDir)).map(async (record) => ({
+            ...peerDisplayRowFromRecord(record, currentMailboxId),
+            presence: mailboxPresence(record),
+            letterCount: await countInboxLetters(inboxPath(peersDir, record.id)),
+        })),
+    )
 
-            if (getInfoMessages().length > 1) {
-                failForObservedCount()
-                return
-            }
+    return sortPeerRows(rows, options.currentCwd)
+}
 
-            scheduleSuccessCheck()
-        }
+function mailboxCleanupBlockReason(row: CleanupMailboxRow): string | undefined {
+    if (row.isMe) return "Current session mailbox cannot be cleaned up."
+    if (row.presence === "live") return "Mailbox is still live."
+    if (row.presence === "stalled") {
+        return "Mailbox is stalled; only offline mailboxes can be cleaned up."
+    }
+    if (row.letterCount > 0) {
+        return `Mailbox inbox still has ${row.letterCount} pending letter${row.letterCount === 1 ? "" : "s"}.`
+    }
+    return undefined
+}
 
-        timeoutTimer = setTimeout(() => {
-            failForObservedCount()
-        }, PEERS_CAPTURE_TIMEOUT_MS)
+async function removeMailboxById(peersDir: string, id: string): Promise<void> {
+    await rm(mailboxRecordPath(peersDir, id), { force: true })
+    await rm(inboxPath(peersDir, id), { force: true, recursive: true })
+}
 
+async function cleanUpMailboxes(options: {
+    peersDir?: string
+    selectedIds: string[]
+    currentCwd: string
+    currentSessionId?: string
+}): Promise<CleanupMailboxResult> {
+    const peersDir = options.peersDir ?? defaultPeersDir()
+    const currentMailboxId = options.currentSessionId
+        ? mailboxId(options.currentCwd, options.currentSessionId)
+        : undefined
+    const cleanedIds: string[] = []
+    const skipped: Array<{ id: string; reason: string }> = []
+
+    for (const id of options.selectedIds) {
+        let raw: string
         try {
-            pi.sendUserMessage(`/${peersCommandName}`, { expandPromptTemplates: true })
+            raw = await readFile(mailboxRecordPath(peersDir, id), "utf8")
         } catch (error) {
-            finish(() => {
-                reject(error instanceof Error ? error : new Error(String(error)))
-            })
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                skipped.push({ id, reason: "Mailbox record is already gone." })
+                continue
+            }
+            throw error
         }
-    })
+
+        const record = parsePeerRecordFile(JSON.parse(raw))
+        if (!record) {
+            skipped.push({ id, reason: "Mailbox record is invalid." })
+            continue
+        }
+
+        const row: CleanupMailboxRow = {
+            ...peerDisplayRowFromRecord(record, currentMailboxId),
+            presence: mailboxPresence(record),
+            letterCount: await countInboxLetters(inboxPath(peersDir, record.id)),
+        }
+        const reason = mailboxCleanupBlockReason(row)
+        if (reason) {
+            skipped.push({ id, reason })
+            continue
+        }
+
+        await removeMailboxById(peersDir, id)
+        cleanedIds.push(id)
+    }
+
+    return { cleanedIds, skipped }
 }
 
 function createPlaceholderItem(label: string, description: string): PeerSelectItem {
@@ -268,12 +330,16 @@ function createPlaceholderItem(label: string, description: string): PeerSelectIt
     }
 }
 
-function formatPeerStatus(status: string): string {
-    return `[${status}]`
+function formatPeerState(state: string): string {
+    return `[${state}]`
 }
 
 function formatPeerListLabel(peer: PeerDisplayRow): string {
     return peer.isMe ? `${peer.label} [me]` : peer.label
+}
+
+function formatMailboxListLabel(row: CleanupMailboxRow): string {
+    return row.isMe ? `${row.label} [me]` : row.label
 }
 
 function formatTabLabel(
@@ -290,7 +356,15 @@ function formatTabLabel(
     return theme.fg("accent", theme.bold(`› ${text} ‹`))
 }
 
-function createPeerSelectItems(peers: PeerDisplayRow[]): PeerSelectItem[] {
+function dimIfUnselected(text: string, isSelected: boolean, theme: Theme): string {
+    return isSelected ? text : theme.fg("dim", text)
+}
+
+function createPeerSelectItems(
+    peers: PeerDisplayRow[],
+    selectedPeerId: string | undefined,
+    theme: Theme,
+): PeerSelectItem[] {
     if (peers.length === 0) {
         return [
             createPlaceholderItem(
@@ -301,10 +375,45 @@ function createPeerSelectItems(peers: PeerDisplayRow[]): PeerSelectItem[] {
     }
 
     return peers.map((peer, index) => ({
-        value: `${peer.sourceName}\0${index}`,
-        label: formatPeerListLabel(peer),
-        description: `${formatPeerStatus(peer.status)}  ${peer.cwd}`,
+        value: `${peer.id}\0${index}`,
+        label: dimIfUnselected(
+            formatPeerListLabel(peer),
+            peer.id === selectedPeerId,
+            theme,
+        ),
+        description: `${formatPeerState(peer.state)}  ${peer.cwd}`,
         peer,
+    }))
+}
+
+function formatMailboxOptionLabel(row: CleanupMailboxRow, checked: boolean): string {
+    return `${checked ? "[x]" : "[ ]"} ${formatMailboxListLabel(row)}`
+}
+
+function createCleanupMailboxItems(
+    rows: CleanupMailboxRow[],
+    checkedIds: ReadonlySet<string>,
+    selectedMailboxId: string | undefined,
+    theme: Theme,
+): PeerSelectItem[] {
+    if (rows.length === 0) {
+        return [
+            createPlaceholderItem(
+                "No peers on this page.",
+                "Switch pages with Tab or ←→.",
+            ),
+        ]
+    }
+
+    return rows.map((row) => ({
+        value: row.id,
+        label: dimIfUnselected(
+            formatMailboxOptionLabel(row, checkedIds.has(row.id)),
+            row.id === selectedMailboxId,
+            theme,
+        ),
+        description: `${formatPeerState(row.state)}  ${row.cwd}`,
+        mailbox: row,
     }))
 }
 
@@ -312,18 +421,15 @@ class PeerAddonPrompt implements Component {
     private readonly container = new Container()
     private readonly title = new Text("", 1, 0)
     private readonly summary = new Text("", 1, 0)
-    private readonly source = new Text("", 1, 0)
-    private readonly details = new Text("", 1, 0)
+    private readonly source = new Text("", 1, 1)
+    private readonly details = new Text("", 1, 1)
     private readonly footer = new Text("", 1, 0)
     private readonly items: PeerSelectItem[] = []
     private readonly selectList: SelectList
     private readonly tui: TUI
     private readonly theme: Theme
     private readonly close: () => void
-    private readonly loadPeers: () => Promise<{
-        pages: PeerPages
-        peersCommandName: string
-    }>
+    private readonly loadPeers: () => Promise<PeerPages>
     private state: PeerLoadState = { kind: "loading" }
     private activeTab: PeerTabKey = "current"
     private disposed = false
@@ -332,7 +438,7 @@ class PeerAddonPrompt implements Component {
         tui: TUI
         theme: Theme
         close: () => void
-        loadPeers: () => Promise<{ pages: PeerPages; peersCommandName: string }>
+        loadPeers: () => Promise<PeerPages>
     }) {
         this.tui = options.tui
         this.theme = options.theme
@@ -341,7 +447,7 @@ class PeerAddonPrompt implements Component {
         this.selectList = new SelectList(this.items, 10, {
             selectedPrefix: (text) => this.theme.fg("accent", text),
             selectedText: (text) => this.theme.fg("accent", text),
-            description: (text) => this.theme.fg("muted", text),
+            description: (text) => this.theme.fg("dim", text),
             scrollInfo: (text) => this.theme.fg("dim", text),
             noMatch: (text) => this.theme.fg("warning", text),
         })
@@ -355,7 +461,7 @@ class PeerAddonPrompt implements Component {
             this.close()
         }
         this.selectList.onSelectionChange = () => {
-            this.refreshText()
+            this.refreshContents(false)
             this.tui.requestRender()
         }
 
@@ -377,9 +483,9 @@ class PeerAddonPrompt implements Component {
 
     async load(): Promise<void> {
         try {
-            const result = await this.loadPeers()
+            const pages = await this.loadPeers()
             if (this.disposed) return
-            this.state = { kind: "ready", ...result }
+            this.state = { kind: "ready", pages }
         } catch (error) {
             if (this.disposed) return
             this.state = {
@@ -436,12 +542,15 @@ class PeerAddonPrompt implements Component {
 
     private refreshItems(resetSelection: boolean): void {
         const peers = this.getActivePeers()
+        const selectedPeerId = resetSelection
+            ? peers[0]?.id
+            : this.getSelectedPeer()?.id
         const nextItems =
             this.state.kind === "loading"
                 ? [
                       createPlaceholderItem(
-                          "Loading /peers…",
-                          "Please wait while pi-peer surveys peer sessions.",
+                          "Loading peers…",
+                          "Please wait while peer records are loaded.",
                       ),
                   ]
                 : this.state.kind === "error"
@@ -451,7 +560,7 @@ class PeerAddonPrompt implements Component {
                             this.state.message,
                         ),
                     ]
-                  : createPeerSelectItems(peers)
+                  : createPeerSelectItems(peers, selectedPeerId, this.theme)
 
         this.items.splice(0, this.items.length, ...nextItems)
         if (resetSelection) {
@@ -465,11 +574,11 @@ class PeerAddonPrompt implements Component {
 
         if (this.state.kind === "loading") {
             this.summary.setText("")
-            this.source.setText(this.theme.fg("dim", "Loading /peers…"))
+            this.source.setText(this.theme.fg("dim", "Loading peers…"))
             this.details.setText(
                 this.theme.fg(
                     "dim",
-                    "Please wait while pi-peer finishes surveying peer sessions.",
+                    "Please wait while peer records are loaded from disk.",
                 ),
             )
             this.footer.setText(this.theme.fg("dim", "Enter/Esc close"))
@@ -507,11 +616,12 @@ class PeerAddonPrompt implements Component {
                 "dim",
                 selectedPeer
                     ? [
-                          `Selected: ${formatPeerListLabel(selectedPeer)}`,
-                          `Status: ${formatPeerStatus(selectedPeer.status)}`,
-                          `Directory: ${selectedPeer.cwd}`,
+                          `id: ${selectedPeer.id}`,
+                          `cwd: ${selectedPeer.cwd}`,
+                          `state: ${selectedPeer.state}`,
+                          `sessionId: ${selectedPeer.sessionId}`,
                       ].join("\n")
-                    : "No peer sessions on this page.",
+                    : "No peers on this page.",
             ),
         )
         this.footer.setText(
@@ -535,21 +645,299 @@ class PeerAddonPrompt implements Component {
     }
 }
 
+class CleanupMailboxesPrompt implements Component {
+    private readonly container = new Container()
+    private readonly title = new Text("", 1, 0)
+    private readonly summary = new Text("", 1, 0)
+    private readonly tabs = new Text("", 1, 1)
+    private readonly details = new Text("", 1, 1)
+    private readonly footer = new Text("", 1, 0)
+    private readonly items: PeerSelectItem[] = []
+    private readonly checkedIds = new Set<string>()
+    private readonly selectList: SelectList
+    private readonly tui: TUI
+    private readonly theme: Theme
+    private readonly notify: ExtensionCommandContext["ui"]["notify"]
+    private readonly close: (selectedIds: string[] | undefined) => void
+    private readonly loadMailboxes: () => Promise<CleanupMailboxPages>
+    private state: CleanupLoadState = { kind: "loading" }
+    private activeTab: PeerTabKey = "current"
+    private disposed = false
+
+    constructor(options: {
+        tui: TUI
+        theme: Theme
+        notify: ExtensionCommandContext["ui"]["notify"]
+        close: (selectedIds: string[] | undefined) => void
+        loadMailboxes: () => Promise<CleanupMailboxPages>
+    }) {
+        this.tui = options.tui
+        this.theme = options.theme
+        this.notify = options.notify
+        this.close = options.close
+        this.loadMailboxes = options.loadMailboxes
+        this.selectList = new SelectList(this.items, 10, {
+            selectedPrefix: (text) => this.theme.fg("accent", text),
+            selectedText: (text) => this.theme.fg("accent", text),
+            description: (text) => this.theme.fg("dim", text),
+            scrollInfo: (text) => this.theme.fg("dim", text),
+            noMatch: (text) => this.theme.fg("warning", text),
+        })
+
+        this.selectList.onSelect = () => {
+            this.dispose()
+            this.close(
+                this.state.kind === "ready" ? Array.from(this.checkedIds) : undefined,
+            )
+        }
+        this.selectList.onCancel = () => {
+            this.dispose()
+            this.close(undefined)
+        }
+        this.selectList.onSelectionChange = () => {
+            this.refreshContents(false)
+            this.tui.requestRender()
+        }
+
+        this.container.addChild(
+            new DynamicBorder((text: string) => this.theme.fg("accent", text)),
+        )
+        this.container.addChild(this.title)
+        this.container.addChild(this.summary)
+        this.container.addChild(this.tabs)
+        this.container.addChild(this.selectList)
+        this.container.addChild(this.details)
+        this.container.addChild(this.footer)
+        this.container.addChild(
+            new DynamicBorder((text: string) => this.theme.fg("accent", text)),
+        )
+
+        this.refreshContents(true)
+    }
+
+    async load(): Promise<void> {
+        try {
+            const pages = await this.loadMailboxes()
+            if (this.disposed) return
+            this.state = { kind: "ready", pages }
+        } catch (error) {
+            if (this.disposed) return
+            this.state = {
+                kind: "error",
+                message: error instanceof Error ? error.message : String(error),
+            }
+        }
+
+        this.refreshContents(true)
+        this.tui.requestRender()
+    }
+
+    dispose(): void {
+        this.disposed = true
+    }
+
+    invalidate(): void {
+        this.container.invalidate()
+        this.selectList.invalidate()
+        this.refreshText()
+    }
+
+    handleInput(data: string): void {
+        if (this.state.kind === "ready") {
+            if (matchesKey(data, Key.space)) {
+                this.toggleSelectedMailbox()
+                this.tui.requestRender()
+                return
+            }
+
+            if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
+                this.switchTab()
+                return
+            }
+
+            if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) {
+                this.switchTab()
+                return
+            }
+        }
+
+        this.selectList.handleInput(data)
+        this.tui.requestRender()
+    }
+
+    render(width: number): string[] {
+        return this.container.render(width)
+    }
+
+    private toggleSelectedMailbox(): void {
+        const selectedItem = this.selectList.getSelectedItem() as PeerSelectItem | null
+        const row = selectedItem?.mailbox
+        if (!selectedItem || !row) {
+            return
+        }
+
+        const reason = mailboxCleanupBlockReason(row)
+        if (reason) {
+            this.notify(reason, "warning")
+            return
+        }
+
+        if (this.checkedIds.has(row.id)) {
+            this.checkedIds.delete(row.id)
+            selectedItem.label = formatMailboxOptionLabel(row, false)
+        } else {
+            this.checkedIds.add(row.id)
+            selectedItem.label = formatMailboxOptionLabel(row, true)
+        }
+
+        this.selectList.invalidate()
+        this.refreshText()
+    }
+
+    private switchTab(): void {
+        this.activeTab = this.activeTab === "current" ? "other" : "current"
+        this.refreshContents(true)
+        this.tui.requestRender()
+    }
+
+    private refreshContents(resetSelection: boolean): void {
+        this.refreshItems(resetSelection)
+        this.refreshText()
+    }
+
+    private refreshItems(resetSelection: boolean): void {
+        const rows = this.getActiveMailboxes()
+        const selectedMailboxId = resetSelection
+            ? rows[0]?.id
+            : this.getSelectedMailbox()?.id
+        const nextItems =
+            this.state.kind === "loading"
+                ? [
+                      createPlaceholderItem(
+                          "Loading peers…",
+                          "Please wait while peer records are loaded.",
+                      ),
+                  ]
+                : this.state.kind === "error"
+                  ? [createPlaceholderItem("Could not load peers", this.state.message)]
+                  : createCleanupMailboxItems(
+                        rows,
+                        this.checkedIds,
+                        selectedMailboxId,
+                        this.theme,
+                    )
+
+        this.items.splice(0, this.items.length, ...nextItems)
+        if (resetSelection) {
+            this.selectList.setSelectedIndex(0)
+        }
+        this.selectList.invalidate()
+    }
+
+    private refreshText(): void {
+        this.title.setText(
+            this.theme.fg("accent", this.theme.bold("Clean up Pi peers")),
+        )
+
+        if (this.state.kind === "loading") {
+            this.summary.setText("")
+            this.tabs.setText(this.theme.fg("dim", "Loading peers…"))
+            this.details.setText(
+                this.theme.fg(
+                    "dim",
+                    "Please wait while peer records are loaded from disk.",
+                ),
+            )
+            this.footer.setText(this.theme.fg("dim", "Enter/Esc close"))
+            return
+        }
+
+        if (this.state.kind === "error") {
+            this.summary.setText("")
+            this.tabs.setText(this.theme.fg("warning", "Could not load peers"))
+            this.details.setText(this.theme.fg("warning", this.state.message))
+            this.footer.setText(this.theme.fg("dim", "Enter/Esc close"))
+            return
+        }
+
+        const currentCount = this.state.pages.current.length
+        const otherCount = this.state.pages.other.length
+        const selectedRow = this.getSelectedMailbox()
+        const currentTab = formatTabLabel(
+            "Current dir",
+            currentCount,
+            this.activeTab === "current",
+            this.theme,
+        )
+        const otherTab = formatTabLabel(
+            "Other dirs",
+            otherCount,
+            this.activeTab === "other",
+            this.theme,
+        )
+
+        this.summary.setText(
+            this.theme.fg(
+                "dim",
+                `${this.checkedIds.size} selected • enter clean up • esc cancel`,
+            ),
+        )
+        this.tabs.setText(`${currentTab}  ${otherTab}`)
+        this.details.setText(
+            this.theme.fg(
+                "dim",
+                selectedRow
+                    ? [
+                          `id: ${selectedRow.id}`,
+                          `cwd: ${selectedRow.cwd}`,
+                          `state: ${selectedRow.state}`,
+                          `sessionId: ${selectedRow.sessionId}`,
+                      ].join("\n")
+                    : "No peers on this page.",
+            ),
+        )
+        this.footer.setText(
+            this.theme.fg(
+                "dim",
+                "↑↓ navigate • Space toggle checkbox • Tab/←→ switch page",
+            ),
+        )
+    }
+
+    private getActiveMailboxes(): CleanupMailboxRow[] {
+        if (this.state.kind !== "ready") {
+            return []
+        }
+
+        return this.activeTab === "current"
+            ? this.state.pages.current
+            : this.state.pages.other
+    }
+
+    private getSelectedMailbox(): CleanupMailboxRow | undefined {
+        const selectedItem = this.selectList.getSelectedItem() as PeerSelectItem | null
+        return selectedItem?.mailbox
+    }
+}
+
 function registerPeerAddonCommand(pi: ExtensionAPI): void {
     pi.registerCommand(PEER_ADDON_COMMAND, {
         description: "Friendly TUI helpers built on top of pi-peer",
         getArgumentCompletions(argumentPrefix) {
             const trimmed = argumentPrefix.trimStart()
-            if (LIST_PEERS_SUBCOMMAND.startsWith(trimmed)) {
-                return [{ value: LIST_PEERS_SUBCOMMAND, label: LIST_PEERS_SUBCOMMAND }]
-            }
-            return null
+            const completions = [LIST_PEERS_SUBCOMMAND, CLEAN_UP_PEERS_SUBCOMMAND]
+                .filter((value) => value.startsWith(trimmed))
+                .map((value) => ({ value, label: value }))
+            return completions.length > 0 ? completions : null
         },
         async handler(args, ctx) {
             const subcommand = normalizeSubcommand(args)
-            if (subcommand !== LIST_PEERS_SUBCOMMAND) {
+            if (
+                subcommand !== LIST_PEERS_SUBCOMMAND &&
+                subcommand !== CLEAN_UP_PEERS_SUBCOMMAND
+            ) {
                 ctx.ui.notify(
-                    `Usage: /${PEER_ADDON_COMMAND} ${LIST_PEERS_SUBCOMMAND}`,
+                    `Usage: /${PEER_ADDON_COMMAND} ${LIST_PEERS_SUBCOMMAND}|${CLEAN_UP_PEERS_SUBCOMMAND}`,
                     "warning",
                 )
                 return
@@ -557,20 +945,75 @@ function registerPeerAddonCommand(pi: ExtensionAPI): void {
 
             if (!ctx.hasUI || ctx.mode !== "tui") {
                 ctx.ui.notify(
-                    "/peer-addon list-peers requires the interactive TUI.",
+                    `/peer-addon ${subcommand} requires the interactive TUI.`,
                     "warning",
                 )
                 return
             }
 
-            const peersCommand = resolvePeersCommand(pi.getCommands())
-            if (!peersCommand) {
-                ctx.ui.notify(MISSING_PI_PEER_MESSAGE, "warning")
+            const currentSessionId = ctx.sessionManager.getSessionId?.()
+
+            if (subcommand === CLEAN_UP_PEERS_SUBCOMMAND) {
+                let prompt: CleanupMailboxesPrompt | undefined
+                const selectedIds = await ctx.ui.custom<string[] | undefined>(
+                    (tui, theme, _kb, done) => {
+                        prompt = new CleanupMailboxesPrompt({
+                            tui,
+                            theme,
+                            notify: ctx.ui.notify,
+                            close: done,
+                            loadMailboxes: () =>
+                                loadCleanupMailboxPages({
+                                    currentCwd: ctx.cwd,
+                                    currentSessionId,
+                                }),
+                        })
+
+                        void prompt.load()
+                        return prompt
+                    },
+                    {
+                        overlay: true,
+                        overlayOptions: {
+                            width: "70%",
+                            minWidth: 48,
+                            maxHeight: "80%",
+                        },
+                    },
+                )
+                prompt?.dispose()
+
+                if (!selectedIds) {
+                    return
+                }
+                if (selectedIds.length === 0) {
+                    ctx.ui.notify("No peers selected.", "warning")
+                    return
+                }
+
+                const result = await cleanUpMailboxes({
+                    selectedIds,
+                    currentCwd: ctx.cwd,
+                    currentSessionId,
+                })
+                const cleanedCount = result.cleanedIds.length
+                const skippedCount = result.skipped.length
+                if (skippedCount > 0) {
+                    ctx.ui.notify(
+                        `Cleaned ${cleanedCount} peer${cleanedCount === 1 ? "" : "s"}; skipped ${skippedCount}: ${result.skipped
+                            .map((entry) => `${entry.id} (${entry.reason})`)
+                            .join("; ")}`,
+                        "warning",
+                    )
+                    return
+                }
+
+                ctx.ui.notify(
+                    `Cleaned ${cleanedCount} peer${cleanedCount === 1 ? "" : "s"}.`,
+                    "info",
+                )
                 return
             }
-
-            const currentSessionId = ctx.sessionManager.getSessionId?.()
-            const currentStatus = ctx.isIdle() ? "idle" : "working"
 
             let prompt: PeerAddonPrompt | undefined
 
@@ -580,22 +1023,11 @@ function registerPeerAddonCommand(pi: ExtensionAPI): void {
                         tui,
                         theme,
                         close: () => done(),
-                        loadPeers: async () => {
-                            const listing = await capturePeersListing(
-                                pi,
-                                ctx,
-                                peersCommand.name,
-                            )
-                            return {
-                                pages: buildPeerPages({
-                                    listing,
-                                    currentCwd: ctx.cwd,
-                                    currentSessionId,
-                                    currentStatus,
-                                }),
-                                peersCommandName: peersCommand.name,
-                            }
-                        },
+                        loadPeers: () =>
+                            loadPeerPages({
+                                currentCwd: ctx.cwd,
+                                currentSessionId,
+                            }),
                     })
 
                     void prompt.load()
