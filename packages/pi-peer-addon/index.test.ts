@@ -1,14 +1,85 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import test from "node:test"
 
 import init, {
+    CLEAN_UP_PEERS_SUBCOMMAND,
     LIST_PEERS_SUBCOMMAND,
     PEER_ADDON_COMMAND,
-    buildPeerPages,
-    parsePeersListing,
 } from "./index.ts"
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+async function settlePrompt(): Promise<void> {
+    for (let index = 0; index < 5; index += 1) {
+        await settle()
+    }
+}
+
+async function withTempPeersDir(run: (dir: string) => Promise<void>): Promise<void> {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-peer-addon-test-"))
+    const previous = process.env.PI_PEER_DIR
+    process.env.PI_PEER_DIR = tempDir
+
+    try {
+        await run(tempDir)
+    } finally {
+        if (previous === undefined) {
+            delete process.env.PI_PEER_DIR
+        } else {
+            process.env.PI_PEER_DIR = previous
+        }
+        await rm(tempDir, { force: true, recursive: true })
+    }
+}
+
+function mailboxId(cwd: string, sessionId: string): string {
+    return createHash("sha256")
+        .update(`${cwd}\0${sessionId}`)
+        .digest("hex")
+        .slice(0, 12)
+}
+
+async function writePeerRecord(
+    dir: string,
+    record: {
+        id: string
+        name: string
+        cwd: string
+        sessionId: string
+        state: string
+        beatAt: number
+        pid?: number
+    },
+): Promise<void> {
+    await writeFile(join(dir, `${record.id}.json`), JSON.stringify(record), "utf8")
+}
+
+async function writeInbox(
+    dir: string,
+    id: string,
+    letters: string[] = [],
+): Promise<void> {
+    const inboxDir = join(dir, `${id}.inbox`)
+    await mkdir(inboxDir, { recursive: true })
+    await Promise.all(
+        letters.map((text, index) =>
+            writeFile(join(inboxDir, `${index + 1}.json`), text, "utf8"),
+        ),
+    )
+}
+
+async function pathExists(path: string): Promise<boolean> {
+    try {
+        await access(path)
+        return true
+    } catch {
+        return false
+    }
+}
 
 interface CapturedNotification {
     message: string
@@ -25,24 +96,15 @@ interface Harness {
     customCalls: Array<{ overlay: boolean | undefined }>
     requestRenderCount: number
     component: any
-    resolvePeers(): void
     ctx: any
 }
 
 function createHarness(options?: {
-    commands?: Array<{
-        name: string
-        source: "extension" | "prompt" | "skill"
-        sourceInfo: { path: string }
-        description?: string
-    }>
-    peersListing?: string
-    peersNotifications?: CapturedNotification[]
-    resolveBeforePeerNotifications?: boolean
     hasUI?: boolean
     mode?: string
     cwd?: string
     sessionId?: string | undefined
+    themeMode?: "plain" | "tagged"
 }): Harness {
     const notifications: CapturedNotification[] = []
     const sentUserMessages: Array<{ content: string; options: unknown }> = []
@@ -52,7 +114,6 @@ function createHarness(options?: {
     let getArgumentCompletions: Harness["getArgumentCompletions"]
     let component: any
     let requestRenderCount = 0
-    let releasePeers: (() => void) | undefined
 
     const ctx = {
         cwd: options?.cwd ?? "/Users/gaoshen/Developers/pi-extensions",
@@ -68,7 +129,7 @@ function createHarness(options?: {
             },
             custom(factory: any, uiOptions?: { overlay?: boolean }) {
                 customCalls.push({ overlay: uiOptions?.overlay })
-                return new Promise<void>((resolve) => {
+                return new Promise((resolve) => {
                     component = factory(
                         {
                             requestRender() {
@@ -79,12 +140,14 @@ function createHarness(options?: {
                             bold(text: string) {
                                 return text
                             },
-                            fg(_color: string, text: string) {
-                                return text
+                            fg(color: string, text: string) {
+                                return options?.themeMode === "tagged"
+                                    ? `<${color}>${text}</${color}>`
+                                    : text
                             },
                         },
                         {},
-                        () => resolve(),
+                        (value?: unknown) => resolve(value),
                     )
                 })
             },
@@ -104,50 +167,10 @@ function createHarness(options?: {
             getArgumentCompletions = commandOptions.getArgumentCompletions
         },
         getCommands() {
-            return (
-                options?.commands ?? [
-                    {
-                        name: "peers",
-                        description: "List peers",
-                        source: "extension",
-                        sourceInfo: { path: "/packages/pi-peer/index.ts" },
-                    },
-                ]
-            )
+            return []
         },
         sendUserMessage(content: string, sendOptions?: unknown) {
             sentUserMessages.push({ content, options: sendOptions })
-            if (!/^\/peers(?::\d+)?$/u.test(content)) return
-
-            releasePeers = () => {
-                const replay = options?.peersNotifications ?? [
-                    {
-                        message:
-                            options?.peersListing ??
-                            [
-                                "2 other pi sessions:",
-                                "  teammate#1a2b  /Users/gaoshen/Developers/pi-extensions  [idle]",
-                                "  demo#9c8d      /Users/gaoshen/Developers/demo           [working]",
-                                "",
-                                'Address a session by the name in the first column: message_peer({ to: "…" }).',
-                            ].join("\n"),
-                        level: "info",
-                    },
-                ]
-
-                const replayNotifications = () => {
-                    for (const notification of replay) {
-                        ctx.ui.notify(notification.message, notification.level)
-                    }
-                }
-
-                if (options?.resolveBeforePeerNotifications) {
-                    setTimeout(replayNotifications, 0)
-                    return
-                }
-
-                replayNotifications()
-            }
         },
     } as any)
 
@@ -167,307 +190,397 @@ function createHarness(options?: {
         get component() {
             return component
         },
-        resolvePeers() {
-            releasePeers?.()
-        },
         ctx,
     }
 }
 
-test("parsePeersListing extracts rows from pi-peer output", () => {
-    const rows = parsePeersListing(
-        [
-            "2 other pi sessions:",
-            "  teammate#1a2b  /Users/gaoshen/Developers/pi-extensions  [idle]",
-            "  demo#9c8d      /Users/gaoshen/Developers/demo           [working]",
-            "",
-            'Address a session by the name in the first column: message_peer({ to: "…" }).',
-        ].join("\n"),
-    )
+test("/peer-addon list-peers shows peer record rows and details from disk", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
 
-    assert.deepEqual(rows, [
-        {
-            sourceName: "teammate#1a2b",
-            cwd: "/Users/gaoshen/Developers/pi-extensions",
-            status: "idle",
-        },
-        {
-            sourceName: "demo#9c8d",
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: "abcd1234ef56",
+            name: "demo",
             cwd: "/Users/gaoshen/Developers/demo",
-            status: "working",
-        },
-    ])
-})
+            sessionId: "demo-session",
+            state: "working",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "abcd1234ef56")
 
-test("buildPeerPages adds the current session and splits current vs other directories", () => {
-    const listing = [
-        "2 other pi sessions:",
-        "  teammate#1a2b  /Users/gaoshen/Developers/pi-extensions  [idle]",
-        "  demo#9c8d      /Users/gaoshen/Developers/demo           [working]",
-    ].join("\n")
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            LIST_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
 
-    const pages = buildPeerPages({
-        listing,
-        currentCwd: "/Users/gaoshen/Developers/pi-extensions",
-        currentSessionId: "4ef5-session",
-        currentStatus: "idle",
-    })
+        assert.equal(harness.customCalls.length, 1)
+        assert.match(harness.component.render(80).join("\n"), /List Pi peers/u)
+        assert.match(harness.component.render(80).join("\n"), /Loading peers/u)
 
-    assert.deepEqual(pages, {
-        current: [
-            {
-                label: "pi-extensions#4ef5",
-                status: "idle",
-                cwd: "/Users/gaoshen/Developers/pi-extensions",
-                sourceName: "[me]",
-                isMe: true,
-            },
-            {
-                label: "pi-extensions#1a2b",
-                status: "idle",
-                cwd: "/Users/gaoshen/Developers/pi-extensions",
-                sourceName: "teammate#1a2b",
-                isMe: false,
-            },
-        ],
-        other: [
-            {
-                label: "demo#9c8d",
-                status: "working",
-                cwd: "/Users/gaoshen/Developers/demo",
-                sourceName: "demo#9c8d",
-                isMe: false,
-            },
-        ],
+        await settlePrompt()
+
+        const currentPage = harness.component.render(100).join("\n")
+        assert.match(currentPage, /› Current dir \(1\) ‹/u)
+        assert.match(currentPage, /Other dirs \(1\)/u)
+        assert.match(currentPage, /pi-extensions#.+ \[me\]\s+\[idle\]/u)
+        assert.match(currentPage, new RegExp(`id: ${currentId}`, "u"))
+        assert.match(currentPage, /cwd: \/Users\/gaoshen\/Developers\/pi-extensions/u)
+        assert.match(currentPage, /state: idle/u)
+        assert.match(currentPage, /sessionId: 4ef5-session/u)
+
+        harness.component.handleInput("\t")
+        const otherPage = harness.component.render(100).join("\n")
+        assert.match(otherPage, /› Other dirs \(1\) ‹/u)
+        assert.match(otherPage, /demo#abcd\s+\[working\]/u)
+        assert.match(otherPage, /id: abcd1234ef56/u)
+        assert.match(otherPage, /cwd: \/Users\/gaoshen\/Developers\/demo/u)
+        assert.match(otherPage, /state: working/u)
+        assert.match(otherPage, /sessionId: demo-session/u)
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
+
+        assert.deepEqual(harness.notifications, [])
+        assert.deepEqual(harness.sentUserMessages, [])
+        assert.ok(harness.requestRenderCount >= 2)
     })
 })
 
-test("/peer-addon list-peers still captures and reformats late /peers notifications", async () => {
-    const harness = createHarness({ resolveBeforePeerNotifications: true })
+test("/peer-addon list-peers no longer depends on the nested /peers command", async () => {
+    await withTempPeersDir(async (dir) => {
+        const harness = createHarness()
+        const commandPromise = harness.commandHandler(
+            LIST_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
 
-    const commandPromise = harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
-    assert.equal(harness.customCalls.length, 1)
-    assert.ok(harness.component)
-    assert.match(harness.component.render(80).join("\n"), /List Pi peers/u)
-    assert.match(harness.component.render(80).join("\n"), /Loading \/peers/u)
-    assert.doesNotMatch(
-        harness.component.render(80).join("\n"),
-        /Runs pi-peer \/peers, then reformats the result\./u,
-    )
+        assert.equal(harness.customCalls.length, 1)
+        await settlePrompt()
 
-    harness.resolvePeers()
-    await settle()
-    await settle()
+        const rendered = harness.component.render(100).join("\n")
+        assert.match(rendered, /No peers on this page\./u)
+        assert.deepEqual(harness.notifications, [])
+        assert.deepEqual(harness.sentUserMessages, [])
 
-    assert.deepEqual(harness.notifications, [])
-
-    const rendered = harness.component.render(100).join("\n")
-    assert.match(rendered, /› Current dir \(2\) ‹/u)
-    assert.match(rendered, /Other dirs \(1\)/u)
-    assert.match(rendered, /pi-extensions#4ef5 \[me\]\s+\[idle\]/u)
-    assert.match(rendered, /pi-extensions#1a2b/u)
-    assert.match(rendered, /Selected: pi-extensions#4ef5 \[me\]/u)
-    assert.match(rendered, /Status: \[idle\]/u)
-    assert.match(rendered, /Directory: \/Users\/gaoshen\/Developers\/pi-extensions/u)
-
-    harness.component.handleInput("\x1b")
-    await commandPromise
+        harness.component.handleInput("\x1b")
+        await commandPromise
+        await rm(dir, { force: true, recursive: true })
+        await mkdir(dir, { recursive: true })
+    })
 })
 
-test("/peer-addon list-peers shows loading first, then renders the parsed pages", async () => {
-    const harness = createHarness()
+test("/peer-addon clean-up-peers shows peer rows and details", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
 
-    const commandPromise = harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: "abcd1234ef56",
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "abcd1234ef56")
 
-    assert.equal(harness.customCalls.length, 1)
-    assert.ok(harness.component)
-    assert.match(harness.component.render(80).join("\n"), /List Pi peers/u)
-    assert.match(harness.component.render(80).join("\n"), /Loading \/peers/u)
-    assert.doesNotMatch(
-        harness.component.render(80).join("\n"),
-        /Runs pi-peer \/peers, then reformats the result\./u,
-    )
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
 
-    harness.resolvePeers()
-    await settle()
+        assert.match(harness.component.render(80).join("\n"), /Loading peers/u)
 
-    const rendered = harness.component.render(100).join("\n")
-    assert.match(rendered, /› Current dir \(2\) ‹/u)
-    assert.match(rendered, /Other dirs \(1\)/u)
-    assert.match(rendered, /pi-extensions#4ef5 \[me\]\s+\[idle\]/u)
-    assert.match(rendered, /pi-extensions#1a2b/u)
-    assert.match(rendered, /Selected: pi-extensions#4ef5 \[me\]/u)
-    assert.doesNotMatch(rendered, /Page: /u)
-    assert.doesNotMatch(rendered, /Source: \/peers/u)
+        await settlePrompt()
 
-    harness.component.handleInput("\t")
-    const otherPage = harness.component.render(100).join("\n")
-    assert.match(otherPage, /› Other dirs \(1\) ‹/u)
-    assert.match(otherPage, /demo#9c8d/u)
-    assert.match(otherPage, /Selected: demo#9c8d/u)
-    assert.match(otherPage, /Status: \[working\]/u)
-    assert.match(otherPage, /Directory: \/Users\/gaoshen\/Developers\/demo/u)
+        const currentPage = harness.component.render(100).join("\n")
+        assert.match(currentPage, /Clean up Pi peers/u)
+        assert.match(currentPage, /› Current dir \(1\) ‹/u)
+        assert.match(currentPage, /Other dirs \(1\)/u)
+        assert.match(currentPage, /\[ \] pi-extensions#.+ \[me\]\s+\[idle\]/u)
+        assert.match(currentPage, new RegExp(`id: ${currentId}`, "u"))
+        assert.match(currentPage, /cwd: \/Users\/gaoshen\/Developers\/pi-extensions/u)
+        assert.match(currentPage, /state: idle/u)
+        assert.match(currentPage, /sessionId: 4ef5-session/u)
 
-    harness.component.handleInput("\x1b")
-    await commandPromise
+        harness.component.handleInput("\t")
+        const otherPage = harness.component.render(100).join("\n")
+        assert.match(otherPage, /› Other dirs \(1\) ‹/u)
+        assert.match(otherPage, /\[ \] demo#abcd\s+\[idle\]/u)
+        assert.match(otherPage, /sessionId: demo-session/u)
 
-    assert.deepEqual(harness.sentUserMessages, [
-        { content: "/peers", options: { expandPromptTemplates: true } },
-    ])
-    assert.ok(harness.requestRenderCount >= 2)
+        harness.component.handleInput("\x1b")
+        await commandPromise
+    })
 })
 
-test("/peer-addon list-peers fails clearly when pi-peer is not installed", async () => {
-    const harness = createHarness({ commands: [] })
+test("/peer-addon clean-up-peers removes selected offline empty peer", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const otherId = "abcd1234ef56"
 
-    await harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: otherId,
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, otherId)
 
-    assert.deepEqual(harness.notifications, [
-        {
-            message:
-                "pi-peer-addon requires the pi-peer /peers command. Install and load @shift-labs/pi-peer, then retry.",
-            level: "warning",
-        },
-    ])
-    assert.equal(harness.customCalls.length, 0)
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        assert.match(harness.component.render(100).join("\n"), /\[x\] demo#abcd/u)
+        harness.component.handleInput("\t")
+        harness.component.handleInput("\t")
+        assert.match(harness.component.render(100).join("\n"), /\[x\] demo#abcd/u)
+
+        harness.component.handleInput("\r")
+        await commandPromise
+
+        assert.equal(await pathExists(join(dir, `${otherId}.json`)), false)
+        assert.equal(await pathExists(join(dir, `${otherId}.inbox`)), false)
+        assert.equal(await pathExists(join(dir, `${currentId}.json`)), true)
+        assert.deepEqual(harness.notifications, [
+            { message: "Cleaned 1 peer.", level: "info" },
+        ])
+    })
 })
 
-test("/peer-addon list-peers requires pi-peer provenance even for a unique /peers command", async () => {
-    const harness = createHarness({
-        commands: [
+test("/peer-addon clean-up-peers blocks current and pending-mail peers", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const otherId = "abcd1234ef56"
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: otherId,
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, otherId, [JSON.stringify({ text: "queued" })])
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput(" ")
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        harness.component.handleInput("\r")
+        await commandPromise
+
+        assert.deepEqual(harness.notifications, [
             {
-                name: "peers",
-                description: "Foreign peers",
-                source: "extension",
-                sourceInfo: { path: "/packages/not-pi-peer/index.ts" },
-            },
-        ],
-    })
-
-    await harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
-
-    assert.deepEqual(harness.notifications, [
-        {
-            message:
-                "pi-peer-addon requires the pi-peer /peers command. Install and load @shift-labs/pi-peer, then retry.",
-            level: "warning",
-        },
-    ])
-    assert.equal(harness.customCalls.length, 0)
-})
-
-test("/peer-addon list-peers chooses the pi-peer command when multiple /peers variants exist", async () => {
-    const harness = createHarness({
-        commands: [
-            {
-                name: "peers:1",
-                description: "Foreign peers",
-                source: "extension",
-                sourceInfo: { path: "/packages/not-pi-peer/index.ts" },
+                message: "Current session mailbox cannot be cleaned up.",
+                level: "warning",
             },
             {
-                name: "peers:2",
-                description: "pi-peer peers",
-                source: "extension",
-                sourceInfo: { path: "/packages/pi-peer/index.ts" },
+                message: "Mailbox inbox still has 1 pending letter.",
+                level: "warning",
             },
-        ],
-    })
-
-    const commandPromise = harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
-    harness.resolvePeers()
-    await settle()
-
-    assert.deepEqual(harness.sentUserMessages, [
-        { content: "/peers:2", options: { expandPromptTemplates: true } },
-    ])
-
-    harness.component.handleInput("\x1b")
-    await commandPromise
-})
-
-test("/peer-addon list-peers forwards nested warnings while still rendering the captured listing", async () => {
-    const harness = createHarness({
-        peersNotifications: [
-            { message: "remote messaging is off", level: "warning" },
             {
-                message: [
-                    "1 other pi session:",
-                    "  teammate#1a2b  /Users/gaoshen/Developers/pi-extensions  [idle]",
-                ].join("\n"),
-                level: "info",
+                message: "No peers selected.",
+                level: "warning",
             },
-        ],
+        ])
+        assert.equal(await pathExists(join(dir, `${currentId}.json`)), true)
+        assert.equal(await pathExists(join(dir, `${otherId}.json`)), true)
     })
-
-    const commandPromise = harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
-    harness.resolvePeers()
-    await settle()
-
-    assert.deepEqual(harness.notifications, [
-        { message: "remote messaging is off", level: "warning" },
-    ])
-    assert.match(harness.component.render(100).join("\n"), /pi-extensions#1a2b/u)
-
-    harness.component.handleInput("\x1b")
-    await commandPromise
 })
 
-test("/peer-addon list-peers restores notify after a failed capture path", async () => {
-    const harness = createHarness({
-        peersNotifications: [
-            { message: "first", level: "info" },
-            { message: "second", level: "info" },
-        ],
+test("/peer-addon list-peers adds section padding and dims unfocused rows", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: "bbbb1234ef56",
+            name: "beta",
+            cwd: currentCwd,
+            sessionId: "beta-session",
+            state: "working",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "bbbb1234ef56")
+
+        const harness = createHarness({
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            themeMode: "tagged",
+        })
+        const commandPromise = harness.commandHandler(
+            LIST_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        const rendered = harness.component.render(100).join("\n")
+        assert.match(
+            rendered,
+            /List Pi peers<\/accent>\s*\n\s*\n\s*<accent>› Current dir/u,
+        )
+        assert.match(
+            rendered,
+            /Other dirs \(0\)<\/dim>\s*\n\s*\n\s*<accent>→ pi-extensions/u,
+        )
+        assert.match(rendered, /\n\s*<dim>beta#bbbb<\/dim><dim>\s+\[working\]/u)
+        assert.match(
+            rendered,
+            /sessionId: 4ef5-session<\/dim>\s*\n\s*\n\s*<dim>↑↓ navigate/u,
+        )
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
     })
-
-    const commandPromise = harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
-    harness.resolvePeers()
-    await settle()
-
-    harness.ctx.ui.notify("after failure", "warning")
-    assert.deepEqual(harness.notifications, [
-        { message: "after failure", level: "warning" },
-    ])
-
-    harness.component.handleInput("\x1b")
-    await commandPromise
 })
 
-test("/peer-addon list-peers fails closed when /peers emits more than one info notification", async () => {
-    const harness = createHarness({
-        peersNotifications: [
-            { message: "first", level: "info" },
-            { message: "second", level: "info" },
-        ],
+test("/peer-addon clean-up-peers adds section padding and dims unfocused rows", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: "bbbb1234ef56",
+            name: "beta",
+            cwd: currentCwd,
+            sessionId: "beta-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "bbbb1234ef56")
+
+        const harness = createHarness({
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            themeMode: "tagged",
+        })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        const rendered = harness.component.render(100).join("\n")
+        assert.match(rendered, /Clean up Pi peers/u)
+        assert.match(
+            rendered,
+            /0 selected • enter clean up • esc cancel<\/dim>\s*\n\s*\n\s*<accent>› Current dir/u,
+        )
+        assert.match(
+            rendered,
+            /Other dirs \(0\)<\/dim>\s*\n\s*\n\s*<accent>→ \[ \] pi-extensions/u,
+        )
+        assert.match(rendered, /\n\s*<dim>\[ \] beta#bbbb<\/dim><dim>\s+\[idle\]/u)
+        assert.match(
+            rendered,
+            /sessionId: 4ef5-session<\/dim>\s*\n\s*\n\s*<dim>↑↓ navigate/u,
+        )
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
     })
-
-    const commandPromise = harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
-    harness.resolvePeers()
-    await settle()
-
-    const rendered = harness.component.render(100).join("\n")
-    assert.match(rendered, /Could not load peer list/u)
-    assert.match(
-        rendered,
-        /Expected exactly one info notification from \/peers, received 2\./u,
-    )
-
-    harness.component.handleInput("\x1b")
-    await commandPromise
 })
 
-test("/peer-addon advertises list-peers completion and warns on unknown subcommands", async () => {
+test("/peer-addon advertises both completions and warns on unknown subcommands", async () => {
     const harness = createHarness()
 
     assert.deepEqual(harness.getArgumentCompletions?.("li"), [
         { value: LIST_PEERS_SUBCOMMAND, label: LIST_PEERS_SUBCOMMAND },
     ])
+    assert.deepEqual(harness.getArgumentCompletions?.("cl"), [
+        {
+            value: CLEAN_UP_PEERS_SUBCOMMAND,
+            label: CLEAN_UP_PEERS_SUBCOMMAND,
+        },
+    ])
 
     await harness.commandHandler("whoami", harness.ctx)
     assert.deepEqual(harness.notifications, [
         {
-            message: "Usage: /peer-addon list-peers",
+            message: "Usage: /peer-addon list-peers|clean-up-peers",
             level: "warning",
         },
     ])
