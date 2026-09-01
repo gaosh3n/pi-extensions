@@ -1,0 +1,39 @@
+{
+    "name": "@gaosh3n/pi-peer-addon",
+    "version": "0.1.0",
+    "description": "An add-on built on top of Pi extension pi-peer",
+    "type": "module",
+    "packageManager": "pnpm@11.23.0",
+    "keywords": [
+        "pi",
+        "extension",
+        "pi-peer",
+        "add-on"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/gaosh3n/pi-extensions.git",
+        "directory": "packages/pi-peer-addon"
+    },
+    "pi": {
+        "extensions": [
+            "./index.ts"
+        ]
+    },
+    "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*"
+    },
+    "files": [
+        "index.ts",
+        "README.md",
+        "LICENSE"
+    ],
+    "publishConfig": {
+        "access": "public"
+    },
+    "engines": {
+        "node": ">=22.19.0"
+    }
+}
