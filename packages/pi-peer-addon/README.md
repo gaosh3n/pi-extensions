@@ -11,8 +11,10 @@
 
 - `/peer-addon list-peers` to browse local peers in Pi
 - `/peer-addon clean-up-peers` to clean up eligible local peers from Pi
-- a two-page TUI: `Current dir` and `Other dirs`
+- `/peer-addon introduce-peers` to introduce the current local peer to other local peers
+- a two-page TUI for browsing and cleanup: `Current dir` and `Other dirs`
 - checkbox-style multi-select cleanup for peer records and inboxes
+- a tabbed peer-introduction prompt with `Prepared`, `Sent`, and `Skipped` pages
 - conservative cleanup safety checks
 
 ## Install both extensions
@@ -48,9 +50,20 @@ Run:
 
 Pi shows a two-page checkbox-style picker for local peer records. Use Tab or ←→ to switch between `Current dir` and `Other dirs`, use <space> to toggle selection, then press Enter to clean only peers that are still eligible for removal.
 
+### Introduce local peers
+
+Run:
+
+```text
+/peer-addon introduce-peers
+```
+
+Pi prepares one first-person greeting message per local peer record, delivers the target-specific receiver messages to the other local peers through a quieter add-on greeting path, also emits the sender's own greeting in the same raw receiver style, and then shows a tabbed peer list for `Prepared`, `Sent`, and `Skipped` introductions.
+
 ## Notes
 
 - This package reads peer record files under `~/.pi/agent/peers/`.
+- `/peer-addon introduce-peers` uses `pi-peer` records for discovery, but delivers greeting files through the add-on's own watched path inside each peer inbox so receivers see only the raw greeting content, without `pi-peer`'s default behavior.
 - Cleanup re-checks disk state before deletion.
 - If `pi-peer` is missing, this package should be treated as not fully configured.
 
