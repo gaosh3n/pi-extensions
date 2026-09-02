@@ -554,6 +554,189 @@ test("/peer-addon clean-up-peers blocks current and pending-mail peers", async (
     })
 })
 
+test("/peer-addon clean-up-peers with safe-mode off can remove live peers with pending mail", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const otherId = "abcd1234ef56"
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+            pid: process.pid,
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: otherId,
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "working",
+            beatAt: Date.now(),
+            pid: process.pid,
+        })
+        await writeInbox(dir, otherId, [JSON.stringify({ text: "queued" })])
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("f")
+        assert.match(harness.component.render(100).join("\n"), /0 selected/u)
+        assert.match(
+            harness.component.render(100).join("\n"),
+            /safe-mode off: live\/stalled peers and pending mail can be selected/u,
+        )
+        assert.match(harness.component.render(100).join("\n"), /f toggle safe-mode/u)
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        assert.match(harness.component.render(100).join("\n"), /\[x\] demo#abcd/u)
+        harness.component.handleInput("\r")
+        await commandPromise
+
+        assert.equal(await pathExists(join(dir, `${otherId}.json`)), false)
+        assert.equal(await pathExists(join(dir, `${otherId}.inbox`)), false)
+        assert.equal(await pathExists(join(dir, `${currentId}.json`)), true)
+        assert.deepEqual(harness.notifications, [
+            {
+                message:
+                    "Safe-mode off. Live/stalled peers and peers with pending mail can now be selected.",
+                level: "warning",
+            },
+            { message: "Cleaned 1 peer with safe-mode off.", level: "info" },
+        ])
+    })
+})
+
+test("/peer-addon clean-up-peers still refuses the current session mailbox with safe-mode off", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+            pid: process.pid,
+        })
+        await writeInbox(dir, currentId)
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("f")
+        harness.component.handleInput(" ")
+        harness.component.handleInput("\r")
+        await commandPromise
+
+        assert.equal(await pathExists(join(dir, `${currentId}.json`)), true)
+        assert.deepEqual(harness.notifications, [
+            {
+                message:
+                    "Safe-mode off. Live/stalled peers and peers with pending mail can now be selected.",
+                level: "warning",
+            },
+            {
+                message: "Current session mailbox cannot be cleaned up.",
+                level: "warning",
+            },
+            {
+                message: "No peers selected.",
+                level: "warning",
+            },
+        ])
+    })
+})
+
+test("/peer-addon clean-up-peers re-enables safe-mode by pruning blocked selections", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const otherId = "abcd1234ef56"
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: otherId,
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "working",
+            beatAt: Date.now(),
+            pid: process.pid,
+        })
+        await writeInbox(dir, otherId, [JSON.stringify({ text: "queued" })])
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("f")
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        assert.match(harness.component.render(100).join("\n"), /\[x\] demo#abcd/u)
+        harness.component.handleInput("f")
+        assert.doesNotMatch(
+            harness.component.render(100).join("\n"),
+            /\[x\] demo#abcd/u,
+        )
+        assert.match(
+            harness.component.render(100).join("\n"),
+            /safe-mode on: only offline peers with empty inboxes/u,
+        )
+        harness.component.handleInput("\r")
+        await commandPromise
+
+        assert.equal(await pathExists(join(dir, `${otherId}.json`)), true)
+        assert.deepEqual(harness.notifications, [
+            {
+                message:
+                    "Safe-mode off. Live/stalled peers and peers with pending mail can now be selected.",
+                level: "warning",
+            },
+            {
+                message:
+                    "Safe-mode on. Cleanup only allows offline peers with empty inboxes.",
+                level: "info",
+            },
+            {
+                message: "No peers selected.",
+                level: "warning",
+            },
+        ])
+    })
+})
+
 test("/peer-addon list-peers adds section padding and dims unfocused rows", async () => {
     await withTempPeersDir(async (dir) => {
         const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
@@ -652,7 +835,7 @@ test("/peer-addon clean-up-peers adds section padding and dims unfocused rows", 
         assert.match(rendered, /Clean up Pi peers/u)
         assert.match(
             rendered,
-            /0 selected • enter clean up • esc cancel<\/dim>\s*\n\s*\n\s*<accent>› Current dir/u,
+            /0 selected<\/dim> • <dim>safe-mode on: only offline peers with empty inboxes<\/dim>\s*\n\s*\n\s*<accent>› Current dir/u,
         )
         assert.match(
             rendered,

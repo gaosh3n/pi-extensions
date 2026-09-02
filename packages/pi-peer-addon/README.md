@@ -48,7 +48,7 @@ Run:
 /peer-addon clean-up-peers
 ```
 
-Pi shows a two-page checkbox-style picker for local peer records. Use Tab or ←→ to switch between `Current dir` and `Other dirs`, use <space> to toggle selection, then press Enter to clean only peers that are still eligible for removal.
+Pi shows a two-page checkbox-style picker for local peer records. Use Tab or ←→ to switch between `Current dir` and `Other dirs`, use <space> to toggle selection, press `f` to toggle safe-mode on/off, then press Enter to clean the selected peers. With safe-mode on, only offline peers with empty inboxes are eligible. With safe-mode off, other live/stalled peers and peers with pending mail can also be selected.
 
 ### Introduce local peers
 
@@ -65,6 +65,7 @@ Pi prepares one first-person greeting message per local peer record, delivers th
 - This package reads peer record files under `~/.pi/agent/peers/`.
 - `/peer-addon introduce-peers` uses `pi-peer` records for discovery, but delivers greeting files through the add-on's own watched path inside each peer inbox so receivers see only the raw greeting content, without `pi-peer`'s default behavior.
 - Cleanup re-checks disk state before deletion.
+- Safe-mode can be toggled with `f`. Even with safe-mode off, the current session's own peer mailbox is still never removable.
 - If `pi-peer` is missing, this package should be treated as not fully configured.
 
 ## Acknowledgements
