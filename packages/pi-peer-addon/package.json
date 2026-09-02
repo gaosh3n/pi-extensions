@@ -1,6 +1,6 @@
 {
     "name": "@gaosh3n/pi-peer-addon",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "An add-on built on top of Pi extension pi-peer",
     "type": "module",
     "packageManager": "pnpm@11.23.0",
