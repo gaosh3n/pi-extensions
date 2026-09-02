@@ -96,6 +96,11 @@ interface CleanupMailboxResult {
     skipped: Array<{ id: string; reason: string }>
 }
 
+interface CleanupPromptResult {
+    selectedIds: string[]
+    safeMode: boolean
+}
+
 interface GreetingTarget {
     id: string
     label: string
@@ -711,8 +716,12 @@ async function loadCleanupMailboxPages(options: {
     return sortPeerRows(rows, options.currentCwd)
 }
 
-function mailboxCleanupBlockReason(row: CleanupMailboxRow): string | undefined {
+function mailboxCleanupBlockReason(
+    row: CleanupMailboxRow,
+    safeMode = true,
+): string | undefined {
     if (row.isMe) return "Current session mailbox cannot be cleaned up."
+    if (!safeMode) return undefined
     if (row.presence === "live") return "Mailbox is still live."
     if (row.presence === "stalled") {
         return "Mailbox is stalled; only offline mailboxes can be cleaned up."
@@ -733,6 +742,7 @@ async function cleanUpMailboxes(options: {
     selectedIds: string[]
     currentCwd: string
     currentSessionId?: string
+    safeMode?: boolean
 }): Promise<CleanupMailboxResult> {
     const peersDir = options.peersDir ?? defaultPeersDir()
     const currentMailboxId = options.currentSessionId
@@ -764,7 +774,7 @@ async function cleanUpMailboxes(options: {
             presence: mailboxPresence(record),
             letterCount: await countInboxLetters(inboxPath(peersDir, record.id)),
         }
-        const reason = mailboxCleanupBlockReason(row)
+        const reason = mailboxCleanupBlockReason(row, options.safeMode ?? true)
         if (reason) {
             skipped.push({ id, reason })
             continue
@@ -1135,17 +1145,18 @@ class CleanupMailboxesPrompt implements Component {
     private readonly tui: TUI
     private readonly theme: Theme
     private readonly notify: ExtensionCommandContext["ui"]["notify"]
-    private readonly close: (selectedIds: string[] | undefined) => void
+    private readonly close: (result: CleanupPromptResult | undefined) => void
     private readonly loadMailboxes: () => Promise<CleanupMailboxPages>
     private state: CleanupLoadState = { kind: "loading" }
     private activeTab: PeerTabKey = "current"
+    private safeMode = true
     private disposed = false
 
     constructor(options: {
         tui: TUI
         theme: Theme
         notify: ExtensionCommandContext["ui"]["notify"]
-        close: (selectedIds: string[] | undefined) => void
+        close: (result: CleanupPromptResult | undefined) => void
         loadMailboxes: () => Promise<CleanupMailboxPages>
     }) {
         this.tui = options.tui
@@ -1164,7 +1175,12 @@ class CleanupMailboxesPrompt implements Component {
         this.selectList.onSelect = () => {
             this.dispose()
             this.close(
-                this.state.kind === "ready" ? Array.from(this.checkedIds) : undefined,
+                this.state.kind === "ready"
+                    ? {
+                          selectedIds: Array.from(this.checkedIds),
+                          safeMode: this.safeMode,
+                      }
+                    : undefined,
             )
         }
         this.selectList.onCancel = () => {
@@ -1227,6 +1243,12 @@ class CleanupMailboxesPrompt implements Component {
                 return
             }
 
+            if (data === "f" || data === "F") {
+                this.toggleSafeMode()
+                this.tui.requestRender()
+                return
+            }
+
             if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
                 this.switchTab()
                 return
@@ -1253,7 +1275,7 @@ class CleanupMailboxesPrompt implements Component {
             return
         }
 
-        const reason = mailboxCleanupBlockReason(row)
+        const reason = mailboxCleanupBlockReason(row, this.safeMode)
         if (reason) {
             this.notify(reason, "warning")
             return
@@ -1269,6 +1291,32 @@ class CleanupMailboxesPrompt implements Component {
 
         this.selectList.invalidate()
         this.refreshText()
+    }
+
+    private toggleSafeMode(): void {
+        this.safeMode = !this.safeMode
+        if (this.safeMode) {
+            this.pruneBlockedSelections()
+        }
+        this.refreshContents(false)
+        this.notify(
+            this.safeMode
+                ? "Safe-mode on. Cleanup only allows offline peers with empty inboxes."
+                : "Safe-mode off. Live/stalled peers and peers with pending mail can now be selected.",
+            this.safeMode ? "info" : "warning",
+        )
+    }
+
+    private pruneBlockedSelections(): void {
+        if (this.state.kind !== "ready") {
+            return
+        }
+
+        for (const row of [...this.state.pages.current, ...this.state.pages.other]) {
+            if (this.checkedIds.has(row.id) && mailboxCleanupBlockReason(row, true)) {
+                this.checkedIds.delete(row.id)
+            }
+        }
     }
 
     private switchTab(): void {
@@ -1354,10 +1402,7 @@ class CleanupMailboxesPrompt implements Component {
         )
 
         this.summary.setText(
-            this.theme.fg(
-                "dim",
-                `${this.checkedIds.size} selected • enter clean up • esc cancel`,
-            ),
+            `${this.theme.fg("dim", `${this.checkedIds.size} selected`)} • ${this.safeMode ? this.theme.fg("dim", "safe-mode on: only offline peers with empty inboxes") : this.theme.fg("warning", "safe-mode off: live/stalled peers and pending mail can be selected")}`,
         )
         this.tabs.setText(`${currentTab}  ${otherTab}`)
         this.details.setText(
@@ -1376,7 +1421,7 @@ class CleanupMailboxesPrompt implements Component {
         this.footer.setText(
             this.theme.fg(
                 "dim",
-                "↑↓ navigate • Space toggle checkbox • Tab/←→ switch page",
+                "↑↓ navigate • Space toggle checkbox • f toggle safe-mode • Tab/←→ switch page • Enter clean up • Esc cancel",
             ),
         )
     }
@@ -1728,7 +1773,9 @@ function registerPeerAddonCommand(pi: ExtensionAPI): void {
 
             if (subcommand === CLEAN_UP_PEERS_SUBCOMMAND) {
                 let prompt: CleanupMailboxesPrompt | undefined
-                const selectedIds = await ctx.ui.custom<string[] | undefined>(
+                const cleanupSelection = await ctx.ui.custom<
+                    CleanupPromptResult | undefined
+                >(
                     (tui, theme, _kb, done) => {
                         prompt = new CleanupMailboxesPrompt({
                             tui,
@@ -1756,24 +1803,28 @@ function registerPeerAddonCommand(pi: ExtensionAPI): void {
                 )
                 prompt?.dispose()
 
-                if (!selectedIds) {
+                if (!cleanupSelection) {
                     return
                 }
-                if (selectedIds.length === 0) {
+                if (cleanupSelection.selectedIds.length === 0) {
                     ctx.ui.notify("No peers selected.", "warning")
                     return
                 }
 
                 const result = await cleanUpMailboxes({
-                    selectedIds,
+                    selectedIds: cleanupSelection.selectedIds,
                     currentCwd: ctx.cwd,
                     currentSessionId,
+                    safeMode: cleanupSelection.safeMode,
                 })
                 const cleanedCount = result.cleanedIds.length
                 const skippedCount = result.skipped.length
+                const cleanedSuffix = cleanupSelection.safeMode
+                    ? "."
+                    : " with safe-mode off."
                 if (skippedCount > 0) {
                     ctx.ui.notify(
-                        `Cleaned ${cleanedCount} peer${cleanedCount === 1 ? "" : "s"}; skipped ${skippedCount}: ${result.skipped
+                        `Cleaned ${cleanedCount} peer${cleanedCount === 1 ? "" : "s"}${cleanupSelection.safeMode ? "" : " with safe-mode off"}; skipped ${skippedCount}: ${result.skipped
                             .map((entry) => `${entry.id} (${entry.reason})`)
                             .join("; ")}`,
                         "warning",
@@ -1782,7 +1833,7 @@ function registerPeerAddonCommand(pi: ExtensionAPI): void {
                 }
 
                 ctx.ui.notify(
-                    `Cleaned ${cleanedCount} peer${cleanedCount === 1 ? "" : "s"}.`,
+                    `Cleaned ${cleanedCount} peer${cleanedCount === 1 ? "" : "s"}${cleanedSuffix}`,
                     "info",
                 )
                 return
