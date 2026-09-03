@@ -1201,6 +1201,372 @@ test("/peer-addon introduce-peers fails clearly when the current pi-peer record 
     })
 })
 
+test("/peer-addon list-peers refuses non-interactive contexts", async () => {
+    const harness = createHarness({ hasUI: false })
+
+    await harness.commandHandler(LIST_PEERS_SUBCOMMAND, harness.ctx)
+
+    assert.deepEqual(harness.notifications, [
+        {
+            message: "/peer-addon list-peers requires the interactive TUI.",
+            level: "warning",
+        },
+    ])
+    assert.equal(harness.customCalls.length, 0)
+})
+
+test("/peer-addon list-peers keeps [me] first on the current page and sorts peers alphabetically otherwise", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: "ffff1234ef56",
+            name: "zeta",
+            cwd: currentCwd,
+            sessionId: "zeta-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "ffff1234ef56")
+        await writePeerRecord(dir, {
+            id: "bbbb1234ef56",
+            name: "alpha",
+            cwd: currentCwd,
+            sessionId: "alpha-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "bbbb1234ef56")
+        await writePeerRecord(dir, {
+            id: "eeee1234ef56",
+            name: "omega",
+            cwd: "/Users/gaoshen/Desktop",
+            sessionId: "omega-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "eeee1234ef56")
+        await writePeerRecord(dir, {
+            id: "aaaa1234ef56",
+            name: "beta",
+            cwd: "/Users/gaoshen/Desktop",
+            sessionId: "beta-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, "aaaa1234ef56")
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            LIST_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        const currentPage = harness.component.render(100).join("\n")
+        assert.ok(
+            currentPage.indexOf("pi-extensions#") < currentPage.indexOf("alpha#bbbb"),
+        )
+        assert.ok(currentPage.indexOf("alpha#bbbb") < currentPage.indexOf("zeta#ffff"))
+
+        harness.component.handleInput("\t")
+        const otherPage = harness.component.render(100).join("\n")
+        assert.ok(otherPage.indexOf("beta#aaaa") < otherPage.indexOf("omega#eeee"))
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
+    })
+})
+
+test("/peer-addon clean-up-peers reports mixed cleaned and skipped results", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const alphaId = "aaaa1234ef56"
+        const betaId = "bbbb1234ef56"
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: alphaId,
+            name: "alpha",
+            cwd: "/Users/gaoshen/Desktop",
+            sessionId: "alpha-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, alphaId)
+        await writePeerRecord(dir, {
+            id: betaId,
+            name: "beta",
+            cwd: "/Users/gaoshen/Desktop",
+            sessionId: "beta-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, betaId)
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        harness.component.handleInput("\x1b[B")
+        harness.component.handleInput(" ")
+        await rm(join(dir, `${betaId}.json`), { force: true })
+        await rm(join(dir, `${betaId}.inbox`), { force: true, recursive: true })
+        harness.component.handleInput("\r")
+        await commandPromise
+
+        assert.deepEqual(harness.notifications, [
+            {
+                message:
+                    "Cleaned 1 peer; skipped 1: bbbb1234ef56 (Mailbox record is already gone.)",
+                level: "warning",
+            },
+        ])
+        assert.equal(await pathExists(join(dir, `${alphaId}.json`)), false)
+    })
+})
+
+test("/peer-addon clean-up-peers treats greeting files as pending mail but ignores the readiness marker", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const otherId = "abcd1234ef56"
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: otherId,
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, otherId)
+        await writeGreetingInboxLetter(dir, otherId, {
+            kind: "peer-addon-greeting",
+            fromId: "sender-id",
+            fromName: "Desktop#9ffb",
+            fromCwd: "/Users/gaoshen/Desktop",
+            text: "hello",
+            sentAt: Date.now(),
+        })
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        harness.component.handleInput("\x1b")
+        await commandPromise
+
+        assert.deepEqual(harness.notifications, [
+            {
+                message: "Mailbox inbox still has 1 pending letter.",
+                level: "warning",
+            },
+        ])
+    })
+})
+
+test("/peer-addon clean-up-peers distinguishes stalled peers from live ones", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+        const stalledId = "abcd1234ef56"
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+        await writePeerRecord(dir, {
+            id: stalledId,
+            name: "demo",
+            cwd: "/Users/gaoshen/Developers/demo",
+            sessionId: "demo-session",
+            state: "working",
+            beatAt: Date.now() - 60_000,
+            pid: process.pid,
+        })
+        await writeInbox(dir, stalledId)
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        harness.component.handleInput("\t")
+        harness.component.handleInput(" ")
+        harness.component.handleInput("\x1b")
+        await commandPromise
+
+        assert.deepEqual(harness.notifications, [
+            {
+                message:
+                    "Mailbox is stalled; only offline mailboxes can be cleaned up.",
+                level: "warning",
+            },
+        ])
+    })
+})
+
+test("/peer-addon list-peers hard-fails on malformed peer JSON", async () => {
+    await withTempPeersDir(async (dir) => {
+        await writeFile(join(dir, "broken.json"), "{", "utf8")
+
+        const harness = createHarness()
+        const commandPromise = harness.commandHandler(
+            LIST_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        const rendered = harness.component.render(100).join("\n")
+        assert.match(rendered, /Could not load peer list/u)
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
+    })
+})
+
+test("/peer-addon clean-up-peers hard-fails on malformed peer JSON", async () => {
+    await withTempPeersDir(async (dir) => {
+        await writeFile(join(dir, "broken.json"), "{", "utf8")
+
+        const harness = createHarness()
+        const commandPromise = harness.commandHandler(
+            CLEAN_UP_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        const rendered = harness.component.render(100).join("\n")
+        assert.match(rendered, /Could not load peers/u)
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
+    })
+})
+
+test("/peer-addon introduce-peers hard-fails on malformed peer JSON", async () => {
+    await withTempPeersDir(async (dir) => {
+        await writeFile(join(dir, "broken.json"), "{", "utf8")
+
+        const harness = createHarness()
+        const commandPromise = harness.commandHandler(
+            INTRODUCE_PEERS_SUBCOMMAND,
+            harness.ctx,
+        )
+
+        await settlePrompt()
+
+        const rendered = harness.component.render(100).join("\n")
+        assert.match(rendered, /Could not introduce peers/u)
+        assert.equal(harness.sentMessages.length, 0)
+
+        harness.component.handleInput("\x1b")
+        await commandPromise
+    })
+})
+
+test("peer-addon receiver replaces its watcher on repeated session_start", async () => {
+    await withTempPeersDir(async (dir) => {
+        const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
+        const currentSessionId = "4ef5-session"
+        const currentId = mailboxId(currentCwd, currentSessionId)
+
+        await writePeerRecord(dir, {
+            id: currentId,
+            name: "pi-extensions",
+            cwd: currentCwd,
+            sessionId: currentSessionId,
+            state: "idle",
+            beatAt: Date.now(),
+        })
+        await writeInbox(dir, currentId)
+
+        const harness = createHarness({ cwd: currentCwd, sessionId: currentSessionId })
+        await harness.emit("session_start", {
+            type: "session_start",
+            reason: "startup",
+        })
+        await harness.emit("session_start", {
+            type: "session_start",
+            reason: "reload",
+        })
+
+        await writeGreetingInboxLetter(dir, currentId, {
+            kind: "peer-addon-greeting",
+            fromId: "sender-id",
+            fromName: "Desktop#9ffb",
+            fromCwd: "/Users/gaoshen/Desktop",
+            text: "hello again",
+            sentAt: Date.now(),
+        })
+
+        await new Promise((resolve) => setTimeout(resolve, 80))
+
+        assert.equal(harness.sentMessages.length, 1)
+
+        await harness.emit("session_shutdown", {
+            type: "session_shutdown",
+            reason: "quit",
+        })
+    })
+})
+
 test("peer-addon receiver intercepts quiet greeting files before pi-peer would render them", async () => {
     await withTempPeersDir(async (dir) => {
         const currentCwd = "/Users/gaoshen/Developers/pi-extensions"
