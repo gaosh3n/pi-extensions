@@ -1,0 +1,37 @@
+{
+    "name": "@gaosh3n/pi-edit-last-prompt",
+    "version": "0.1.0",
+    "description": "Re-edit the last aborted prompt in the current Pi session.",
+    "type": "module",
+    "packageManager": "pnpm@11.23.0",
+    "keywords": [
+        "pi",
+        "extension",
+        "prompt"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/gaosh3n/pi-extensions.git",
+        "directory": "packages/pi-edit-last-prompt"
+    },
+    "pi": {
+        "extensions": [
+            "./index.ts"
+        ]
+    },
+    "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*"
+    },
+    "files": [
+        "index.ts",
+        "README.md",
+        "LICENSE"
+    ],
+    "publishConfig": {
+        "access": "public"
+    },
+    "engines": {
+        "node": ">=22.19.0"
+    }
+}
