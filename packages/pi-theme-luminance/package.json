@@ -1,6 +1,6 @@
 {
     "name": "@gaosh3n/pi-theme-luminance",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Sync Pi light/dark theme with terminal background luminance.",
     "type": "module",
     "packageManager": "pnpm@11.23.0",
