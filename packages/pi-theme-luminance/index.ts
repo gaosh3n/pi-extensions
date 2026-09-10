@@ -26,7 +26,12 @@ export interface ThemeLuminanceDeps {
         pi: Pick<ExtensionAPI, "exec">,
         ctx: ExtensionContext,
     ): Promise<ExecResult>
+    scheduleReloadSync?(callback: () => Promise<void>): () => void
 }
+
+// Pi 0.84.4's automatic terminal-theme detector waits up to 100ms.
+// Leave a small margin so reload synchronization runs after that pass.
+const RELOAD_SYNC_DELAY_MS = 150
 
 export const defaultThemeLuminanceDeps: ThemeLuminanceDeps = {
     getTermProgram: () => process.env.TERM_PROGRAM,
@@ -37,14 +42,45 @@ export const defaultThemeLuminanceDeps: ThemeLuminanceDeps = {
             timeout: 2000,
         })
     },
+    scheduleReloadSync(callback) {
+        const timer = setTimeout(() => {
+            void callback().catch(() => {})
+        }, RELOAD_SYNC_DELAY_MS)
+
+        return () => clearTimeout(timer)
+    },
 }
 
 export default function initThemeLuminance(
     pi: ExtensionAPI,
     deps: ThemeLuminanceDeps = defaultThemeLuminanceDeps,
 ): void {
+    let reloadGeneration = 0
+    let cancelScheduledReload: (() => void) | undefined
+    const scheduleReloadSync =
+        deps.scheduleReloadSync ?? defaultThemeLuminanceDeps.scheduleReloadSync!
+
+    pi.on("session_shutdown", () => {
+        reloadGeneration++
+        cancelScheduledReload?.()
+        cancelScheduledReload = undefined
+    })
+
     pi.on("session_start", async (event, ctx) => {
         if (event.reason !== "startup" && event.reason !== "reload") {
+            return
+        }
+
+        if (event.reason === "reload") {
+            cancelScheduledReload?.()
+            const generation = ++reloadGeneration
+            cancelScheduledReload = scheduleReloadSync(async () => {
+                if (generation !== reloadGeneration) {
+                    return
+                }
+
+                await syncThemeLuminance(pi, ctx, deps)
+            })
             return
         }
 
@@ -108,11 +144,19 @@ export async function syncThemeLuminance(
         return
     }
 
-    if (currentThemeName === targetTheme || !ctx.ui.getTheme(targetTheme)) {
+    if (currentThemeName === targetTheme) {
         return
     }
 
-    ctx.ui.setTheme(targetTheme)
+    const theme = ctx.ui.getTheme(targetTheme)
+    if (!theme) {
+        return
+    }
+
+    // Passing a Theme object keeps this runtime-only. Pi persists when a
+    // theme name is passed to setTheme(), which would destroy an automatic
+    // light/dark setting such as "dayowl/nightowl".
+    ctx.ui.setTheme(theme)
 }
 
 export function parseGhosttyBackground(stdout: string): string | undefined {

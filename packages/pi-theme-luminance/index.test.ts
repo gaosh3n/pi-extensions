@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { writeFileSync } from "node:fs"
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -79,6 +80,9 @@ function createSessionStartHarness(options?: {
                     timeout: 2000,
                 })
             },
+            scheduleReloadSync() {
+                return () => {}
+            },
             ...options?.deps,
         },
     )
@@ -91,8 +95,14 @@ function createSyncContext(options: {
     currentThemeName?: string | undefined
     availableThemes?: string[]
     projectTrusted?: boolean
-}): { ctx: any; setThemeCalls: string[] } {
+    onSetTheme?: (theme: unknown) => void
+}): { ctx: any; setThemeCalls: string[]; setThemeArguments: unknown[] } {
     const setThemeCalls: string[] = []
+    const setThemeArguments: unknown[] = []
+    const currentTheme = { name: options.currentThemeName }
+    const themeObjects = new Map(
+        (options.availableThemes ?? ["light", "dark"]).map((name) => [name, { name }]),
+    )
 
     return {
         ctx: {
@@ -100,21 +110,28 @@ function createSyncContext(options: {
             signal: undefined,
             isProjectTrusted: () => options.projectTrusted ?? true,
             ui: {
-                theme: {
-                    name: options.currentThemeName,
-                },
+                theme: currentTheme,
                 getTheme(name: string) {
-                    return (options.availableThemes ?? ["light", "dark"]).includes(name)
-                        ? { name }
-                        : undefined
+                    return themeObjects.get(name)
                 },
-                setTheme(name: string) {
-                    setThemeCalls.push(name)
+                setTheme(theme: unknown) {
+                    setThemeArguments.push(theme)
+                    setThemeCalls.push(
+                        typeof theme === "string"
+                            ? theme
+                            : (theme as { name: string }).name,
+                    )
+                    currentTheme.name =
+                        typeof theme === "string"
+                            ? theme
+                            : (theme as { name: string }).name
+                    options.onSetTheme?.(theme)
                     return { success: true }
                 },
             },
         },
         setThemeCalls,
+        setThemeArguments,
     }
 }
 
@@ -179,6 +196,9 @@ function createGhosttyDeps(stdout: string): ThemeLuminanceDeps {
             code: 0,
             killed: false,
         }),
+        scheduleReloadSync() {
+            return () => {}
+        },
     }
 }
 
@@ -240,6 +260,170 @@ test(
         )
     },
 )
+
+test(
+    "keeps an automatic saved theme pair when switching the runtime theme",
+    { concurrency: false },
+    async () => {
+        await withTempSettings(
+            { globalTheme: "dayowl/nightowl" },
+            async ({ agentDir, projectDir }) => {
+                const { ctx, setThemeCalls, setThemeArguments } = createSyncContext({
+                    cwd: projectDir,
+                    currentThemeName: "dayowl",
+                    availableThemes: ["dayowl", "nightowl"],
+                    onSetTheme(theme) {
+                        // Pi persists when setTheme receives a name. This
+                        // simulates that behavior so the test catches a
+                        // regression to name-based switching.
+                        if (typeof theme === "string") {
+                            writeFileSync(
+                                join(agentDir, "settings.json"),
+                                JSON.stringify({ theme }),
+                            )
+                        }
+                    },
+                })
+
+                await syncThemeLuminance(
+                    {
+                        exec: async () => ({
+                            stdout: "",
+                            stderr: "",
+                            code: 0,
+                            killed: false,
+                        }),
+                    } as any,
+                    ctx,
+                    createGhosttyDeps("background = #000000\n"),
+                )
+
+                assert.deepEqual(setThemeCalls, ["nightowl"])
+                assert.strictEqual(setThemeArguments[0], ctx.ui.getTheme("nightowl"))
+                assert.notEqual(typeof setThemeArguments[0], "string")
+                assert.equal(
+                    getSavedThemeSetting({
+                        cwd: projectDir,
+                        agentDir,
+                        projectTrusted: true,
+                    }),
+                    "dayowl/nightowl",
+                )
+            },
+        )
+    },
+)
+
+test(
+    "keeps the dark side after Pi reapplies Automatic during reload",
+    { concurrency: false },
+    async () => {
+        await withTempSettings(
+            { globalTheme: "dayowl/nightowl" },
+            async ({ projectDir }) => {
+                const { ctx } = createSyncContext({
+                    cwd: projectDir,
+                    currentThemeName: "dayowl",
+                    availableThemes: ["dayowl", "nightowl"],
+                })
+                let sessionStart:
+                    | ((event: { reason: string }, context: any) => Promise<void>)
+                    | undefined
+                let scheduledSync: (() => Promise<void>) | undefined
+
+                initThemeLuminance(
+                    {
+                        on(event: string, handler: any) {
+                            if (event === "session_start") {
+                                sessionStart = handler
+                            }
+                        },
+                        exec: async () => ({
+                            stdout: "",
+                            stderr: "",
+                            code: 0,
+                            killed: false,
+                        }),
+                    } as any,
+                    {
+                        getTermProgram: () => "ghostty",
+                        showGhosttyConfig: async () => ({
+                            stdout: "background = #000000\n",
+                            stderr: "",
+                            code: 0,
+                            killed: false,
+                        }),
+                        scheduleReloadSync(callback) {
+                            scheduledSync = callback
+                            return () => {}
+                        },
+                    },
+                )
+
+                // Pi emits session_start before its reload path reapplies
+                // the saved Automatic setting.
+                await sessionStart?.({ reason: "reload" }, ctx)
+                ctx.ui.setTheme("dayowl")
+                await scheduledSync?.()
+
+                assert.equal(ctx.ui.theme.name, "nightowl")
+            },
+        )
+    },
+)
+
+test("cancels stale deferred reload syncs", async () => {
+    const callbacks: Array<() => Promise<void>> = []
+    const cancellations: number[] = []
+    const handlers = new Map<string, (event: any, ctx: any) => Promise<void>>()
+    let getTermProgramCalls = 0
+
+    initThemeLuminance(
+        {
+            on(event: string, handler: any) {
+                handlers.set(event, handler)
+            },
+            exec: async () => ({
+                stdout: "",
+                stderr: "",
+                code: 0,
+                killed: false,
+            }),
+        } as any,
+        {
+            getTermProgram: () => {
+                getTermProgramCalls++
+                return "ghostty"
+            },
+            showGhosttyConfig: async () => ({
+                stdout: "background = #000000\n",
+                stderr: "",
+                code: 0,
+                killed: false,
+            }),
+            scheduleReloadSync(callback) {
+                const index = callbacks.push(callback) - 1
+                return () => cancellations.push(index)
+            },
+        },
+    )
+
+    const sessionStart = handlers.get("session_start")
+    const sessionShutdown = handlers.get("session_shutdown")
+    assert.ok(sessionStart)
+    assert.ok(sessionShutdown)
+
+    await sessionStart({ reason: "reload" }, {})
+    await sessionStart({ reason: "reload" }, {})
+    assert.deepEqual(cancellations, [0])
+
+    await sessionShutdown({ reason: "reload" }, {})
+    assert.deepEqual(cancellations, [0, 1])
+
+    await callbacks[0]?.()
+    await callbacks[1]?.()
+    assert.equal(getTermProgramCalls, 0)
+})
 
 test(
     "syncs fixed saved light or dark themes using Pi built-in light and dark",
@@ -375,6 +559,9 @@ test("ghostty command failure is a no-op", { concurrency: false }, async () => {
                     code: 127,
                     killed: false,
                 }),
+                scheduleReloadSync() {
+                    return () => {}
+                },
             },
         )
 
