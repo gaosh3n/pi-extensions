@@ -33,6 +33,8 @@ import {
     formatUtcTimestamp,
 } from "./internal/reports.ts"
 import {
+    applyCatalogView,
+    createCatalogSearchClient,
     defaultPackageManagerDeps,
     type PackageManagerDeps,
 } from "./internal/runtime.ts"
@@ -53,9 +55,15 @@ export default function initPackageManager(
 
     pi.registerCommand("package-manager", {
         description:
-            "Manage Pi packages (usage: /package-manager [status|update|install|uninstall])",
+            "Manage Pi packages (usage: /package-manager [status|update|install|install-via-catalog|uninstall])",
         getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-            const items = ["status", "update", "install", "uninstall"].map((value) => ({
+            const items = [
+                "status",
+                "update",
+                "install",
+                "install-via-catalog",
+                "uninstall",
+            ].map((value) => ({
                 value,
                 label: value,
             }))
@@ -86,13 +94,18 @@ export default function initPackageManager(
                 return
             }
 
+            if (subcommand === "install-via-catalog") {
+                await controller.handleInstallViaCatalog(ctx)
+                return
+            }
+
             if (subcommand === "uninstall") {
                 await controller.handleUninstall(ctx)
                 return
             }
 
             ctx.ui.notify(
-                "Usage: /package-manager [status|update|install|uninstall]",
+                "Usage: /package-manager [status|update|install|install-via-catalog|uninstall]",
                 "warning",
             )
         },
@@ -101,6 +114,8 @@ export default function initPackageManager(
 
 export {
     AUTO_UPDATE_RECORD_ENTRY_TYPE,
+    applyCatalogView,
+    createCatalogSearchClient,
     PACKAGE_MANAGER_TITLE,
     REPORT_ENTRY_TYPE,
     createAutomaticUpdateWidgetLines,

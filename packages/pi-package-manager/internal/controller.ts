@@ -22,14 +22,25 @@ import {
     getExecFailureDetail,
     setPackageManagerWidget,
 } from "./reports.ts"
-import { defaultPackageManagerDeps, type PackageManagerDeps } from "./runtime.ts"
+import {
+    defaultPackageManagerDeps,
+    isValidCatalogVersion,
+    sanitizeCatalogPackage,
+    type PackageManagerDeps,
+} from "./runtime.ts"
+import { promptForCatalogPackage } from "./catalog-picker.ts"
 import { promptForPackagesToUninstall } from "./uninstall-picker.ts"
+import type { CatalogPackage } from "./model.ts"
 
 export function createPackageManagerController(
     pi: Pick<ExtensionAPI, "appendEntry" | "sendUserMessage" | "exec">,
     deps: PackageManagerDeps = defaultPackageManagerDeps,
 ) {
     let sessionIsActive = true
+    let sessionGeneration = 0
+    let catalogClient = deps.createCatalogSearchClient?.()
+    let catalogSearch = catalogClient?.search.bind(catalogClient) ?? deps.searchCatalog
+    const catalogControllers = new Set<AbortController>()
 
     return {
         onSessionStart,
@@ -37,6 +48,7 @@ export function createPackageManagerController(
         handleStatus,
         handleUpdate,
         handleInstall,
+        handleInstallViaCatalog,
         handleUninstall,
     }
 
@@ -45,6 +57,14 @@ export function createPackageManagerController(
         _ctx: ExtensionContext,
     ): Promise<void> {
         sessionIsActive = true
+        sessionGeneration += 1
+        for (const controller of catalogControllers) {
+            controller.abort()
+        }
+        catalogControllers.clear()
+        catalogClient?.dispose()
+        catalogClient = deps.createCatalogSearchClient?.()
+        catalogSearch = catalogClient?.search.bind(catalogClient) ?? deps.searchCatalog
 
         if (!shouldAutoUpdateOnSessionStart(event)) {
             return
@@ -57,6 +77,14 @@ export function createPackageManagerController(
 
     async function onSessionShutdown(): Promise<void> {
         sessionIsActive = false
+        sessionGeneration += 1
+        for (const controller of catalogControllers) {
+            controller.abort()
+        }
+        catalogControllers.clear()
+        catalogClient?.dispose()
+        catalogClient = undefined
+        catalogSearch = deps.searchCatalog
     }
 
     async function handleStatus(ctx: ExtensionCommandContext): Promise<void> {
@@ -272,6 +300,115 @@ export function createPackageManagerController(
         }
     }
 
+    async function handleInstallViaCatalog(
+        ctx: ExtensionCommandContext,
+    ): Promise<void> {
+        if (ctx.mode !== "tui") {
+            ctx.ui.notify(
+                "/package-manager install-via-catalog requires TUI mode.",
+                "warning",
+            )
+            return
+        }
+
+        const generation = sessionGeneration
+        const catalogController = new AbortController()
+        catalogControllers.add(catalogController)
+
+        try {
+            const selected = await promptForCatalogPackage(
+                ctx,
+                catalogSearch,
+                catalogController.signal,
+            )
+
+            if (!isSessionGenerationCurrent(generation) || !selected) {
+                return
+            }
+
+            const safeSelected = sanitizeCatalogPackage(selected)
+            if (!safeSelected || !isValidCatalogPackage(safeSelected)) {
+                ctx.ui.notify("The selected catalog package is invalid.", "error")
+                return
+            }
+
+            const source = safeSelected.installSource
+            const confirmed = await ctx.ui.confirm(
+                `Install ${safeSelected.name}@${safeSelected.version}?`,
+                [
+                    `Types: ${safeSelected.types.join(", ")}`,
+                    `Publisher: ${safeSelected.publisher ?? "unknown"}`,
+                    `Source: ${source}`,
+                    safeSelected.description || "No description.",
+                ].join("\n"),
+            )
+
+            if (!confirmed || !isSessionGenerationCurrent(generation)) {
+                return
+            }
+
+            const startedAtUtc = deps.nowIso()
+            setPackageManagerWidget(ctx, {
+                mode: "package-installing",
+                source,
+            })
+
+            try {
+                const result = await deps.runNativeInstall(pi, ctx, source)
+
+                if (!isSessionGenerationCurrent(generation)) {
+                    return
+                }
+
+                appendReport({
+                    type: REPORT_ENTRY_TYPE,
+                    report: createInstallResultReport({
+                        startedAtUtc,
+                        endedAtUtc: deps.nowIso(),
+                        source,
+                        outcome: result.code === 0 ? "succeeded" : "failed",
+                        output: getExecDisplayOutput(result),
+                        reason:
+                            result.code === 0
+                                ? undefined
+                                : getExecFailureDetail(
+                                      result,
+                                      "Package install command failed.",
+                                  ),
+                    }),
+                })
+            } catch (error) {
+                if (!isSessionGenerationCurrent(generation)) {
+                    return
+                }
+
+                appendReport({
+                    type: REPORT_ENTRY_TYPE,
+                    report: createInstallResultReport({
+                        startedAtUtc,
+                        endedAtUtc: deps.nowIso(),
+                        source,
+                        outcome: "failed",
+                        reason: getErrorMessage(error),
+                    }),
+                })
+            } finally {
+                if (isSessionGenerationCurrent(generation)) {
+                    clearPackageManagerWidget(ctx)
+                }
+            }
+        } catch (error) {
+            if (isSessionGenerationCurrent(generation)) {
+                ctx.ui.notify(
+                    `Catalog search failed: ${getErrorMessage(error)}`,
+                    "error",
+                )
+            }
+        } finally {
+            catalogControllers.delete(catalogController)
+        }
+    }
+
     async function handleUninstall(ctx: ExtensionCommandContext): Promise<void> {
         if (ctx.mode !== "tui") {
             ctx.ui.notify("/package-manager uninstall requires TUI mode.", "warning")
@@ -429,6 +566,10 @@ export function createPackageManagerController(
         return sessionIsActive
     }
 
+    function isSessionGenerationCurrent(generation: number): boolean {
+        return sessionIsActive && generation === sessionGeneration
+    }
+
     async function runReloadCountdown(
         ctx: ExtensionContext,
         seconds = RELOAD_COUNTDOWN_SECONDS,
@@ -478,4 +619,33 @@ function getErrorMessage(error: unknown): string {
     }
 
     return String(error)
+}
+
+function isValidCatalogPackage(pkg: CatalogPackage): boolean {
+    return (
+        isValidNpmPackageName(pkg.name) &&
+        pkg.installSource === `npm:${pkg.name}` &&
+        isValidCatalogVersion(pkg.version) &&
+        pkg.types.length > 0
+    )
+}
+
+function hasUnsafeNpmNameCharacters(value: string): boolean {
+    return (
+        /\\s/u.test(value) ||
+        [...value].some((character) => {
+            const code = character.codePointAt(0) ?? 0
+            return code <= 31 || code === 127
+        })
+    )
+}
+
+function isValidNpmPackageName(value: string): boolean {
+    return (
+        value.length <= 214 &&
+        !hasUnsafeNpmNameCharacters(value) &&
+        !value.includes("..") &&
+        (/^@[a-z0-9][a-z0-9._~-]*\/[a-z0-9][a-z0-9._~-]*$/u.test(value) ||
+            /^[a-z0-9][a-z0-9._~-]*$/u.test(value))
+    )
 }
