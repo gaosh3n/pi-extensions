@@ -9,6 +9,7 @@
 - `/package-manager status` to see whether updates are available
 - `/package-manager update` to run the update flow on demand
 - `/package-manager install` to install a Pi package from an entered source
+- `/package-manager install-via-catalog` to search discoverable npm Pi packages and install one with confirmation
 - `/package-manager uninstall` to remove one or more installed Pi packages from a checkbox-style picker
 - a final result card in Pi so you can review the latest outcome
 - automatic Pi reload after a successful startup update
@@ -56,6 +57,16 @@ Run:
 ```
 
 Pi will prompt you for a package source such as `npm:@foo/bar` or `git:github.com/user/repo`, run the native `pi install ...` flow, and show a final result card. After a successful install, run `/reload` to activate the installed package resources.
+
+### Install from the package catalog
+
+Run:
+
+```text
+/package-manager install-via-catalog
+```
+
+The catalog searches npm packages carrying the `pi-package` keyword. Use the search input, type filter, and sort selector; press Tab or Shift+Tab to move focus. The command uses bounded npm JSON requests and may show a partial-results warning when package metadata cannot be resolved. It classifies packages from explicit `package.json.pi` declarations and does not scrape `pi.dev` HTML or inspect package tarballs. Review the package details and confirm before installation. After a successful install, run `/reload` to activate the installed resources.
 
 ### Uninstall package(s)
 

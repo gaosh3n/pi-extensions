@@ -7,11 +7,61 @@ export const OUTPUT_PREVIEW_LINE_COUNT = 8
 export const UPDATE_COMMAND = ["update", "--extensions"] as const
 export const INSTALL_COMMAND = ["install"] as const
 export const UNINSTALL_COMMAND = ["uninstall"] as const
+export const CATALOG_SEARCH_LIMIT = 50
+export const CATALOG_OVERALL_TIMEOUT_MS = 10_000
+export const CATALOG_REQUEST_TIMEOUT_MS = 3_000
+export const CATALOG_MAX_RESPONSE_BYTES = 1_048_576
+export const CATALOG_METADATA_CONCURRENCY = 4
+export const CATALOG_MAX_RETRIES = 1
+export const CATALOG_CACHE_TTL_MS = 5 * 60_000
+export const CATALOG_SEARCH_CACHE_SIZE = 16
+export const CATALOG_METADATA_CACHE_SIZE = 128
 
 export type AutoUpdateOutcome = "succeeded" | "failed" | "skipped"
 export type InstallOutcome = "succeeded" | "failed"
 export type UninstallOutcome = "succeeded" | "partial" | "failed"
 export type ReportTone = "info" | "success" | "warning" | "error"
+export type CatalogPackageType = "extension" | "prompt" | "skill" | "theme"
+export type CatalogSort = "downloads" | "recent" | "name"
+
+export interface CatalogSearchRequest {
+    query: string
+    type: CatalogPackageType | "all"
+    sort: CatalogSort
+}
+
+export interface CatalogPackageLinks {
+    npm?: string
+    repository?: string
+}
+
+export interface CatalogPackage {
+    name: string
+    version: string
+    description: string
+    publisher?: string
+    publishedAt?: string
+    downloadCount?: number
+    downloadPeriod: "weekly"
+    types: CatalogPackageType[]
+    links: CatalogPackageLinks
+    installSource: string
+}
+
+export interface CatalogSearchResult {
+    packages: CatalogPackage[]
+    metadataIncomplete: boolean
+    unresolvedMetadataCount: number
+    stale: boolean
+}
+
+export interface CatalogSearchClient {
+    search(
+        request: CatalogSearchRequest,
+        signal: AbortSignal,
+    ): Promise<CatalogSearchResult>
+    dispose(): void
+}
 
 export type WidgetState =
     | { mode: "status-checking" }

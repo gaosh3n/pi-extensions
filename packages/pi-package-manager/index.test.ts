@@ -35,8 +35,14 @@ interface CapturedCustomCall {
     overlay: boolean | undefined
 }
 
+interface CapturedConfirmCall {
+    title: string
+    message: string | undefined
+}
+
 interface Harness {
     customCalls: CapturedCustomCall[]
+    confirmCalls: CapturedConfirmCall[]
     commandDescription: string | undefined
     getArgumentCompletions:
         | ((prefix: string) => Array<{ value: string; label: string }> | null)
@@ -70,6 +76,7 @@ function createHarness(options?: {
     sessionEntries?: any[]
     inputReturnValue?: string | undefined
     customReturnValue?: unknown
+    confirmReturnValue?: boolean
 }): Harness {
     const entries: CapturedEntry[] = []
     const notifications: Array<{ message: string; level: string }> = []
@@ -79,6 +86,7 @@ function createHarness(options?: {
     const sessionEntries = [...(options?.sessionEntries ?? [])]
     const inputCalls: CapturedInputCall[] = []
     const customCalls: CapturedCustomCall[] = []
+    const confirmCalls: CapturedConfirmCall[] = []
 
     let reportRenderer: Harness["reportRenderer"]
     let commandDescription: Harness["commandDescription"]
@@ -108,6 +116,12 @@ function createHarness(options?: {
             createExecResult({ code: 0, stdout: "", stderr: "" }),
         runNativeUninstall: async () =>
             createExecResult({ code: 0, stdout: "", stderr: "" }),
+        searchCatalog: async () => ({
+            packages: [],
+            metadataIncomplete: false,
+            unresolvedMetadataCount: 0,
+            stale: false,
+        }),
         ...options?.deps,
     }
 
@@ -150,6 +164,11 @@ function createHarness(options?: {
                 assertSessionActive()
                 customCalls.push({ overlay: uiOptions?.overlay })
                 return options?.customReturnValue
+            },
+            async confirm(title: string, message?: string) {
+                assertSessionActive()
+                confirmCalls.push({ title, message })
+                return options?.confirmReturnValue ?? false
             },
             async input(title: string, placeholder?: string) {
                 assertSessionActive()
@@ -222,6 +241,7 @@ function createHarness(options?: {
     return {
         commandDescription,
         customCalls,
+        confirmCalls,
         getArgumentCompletions,
         inputCalls,
         entries,
@@ -368,15 +388,15 @@ test("package-manager command exposes status update install and uninstall", () =
 
     assert.equal(
         harness.commandDescription,
-        "Manage Pi packages (usage: /package-manager [status|update|install|uninstall])",
+        "Manage Pi packages (usage: /package-manager [status|update|install|install-via-catalog|uninstall])",
     )
     assert.deepEqual(
         harness.getArgumentCompletions?.("")?.map((item) => item.value),
-        ["status", "update", "install", "uninstall"],
+        ["status", "update", "install", "install-via-catalog", "uninstall"],
     )
     assert.deepEqual(
         harness.getArgumentCompletions?.("in")?.map((item) => item.value),
-        ["install"],
+        ["install", "install-via-catalog"],
     )
     assert.deepEqual(
         harness.getArgumentCompletions?.("un")?.map((item) => item.value),
@@ -1410,6 +1430,134 @@ test("status clears its widget after completion", async () => {
         key: "pi-package-manager",
         content: undefined,
     })
+})
+
+test("catalog install requires TUI mode and does not search otherwise", async () => {
+    let searches = 0
+    const harness = createHarness({
+        deps: {
+            searchCatalog: async () => {
+                searches += 1
+                return {
+                    packages: [],
+                    metadataIncomplete: false,
+                    unresolvedMetadataCount: 0,
+                    stale: false,
+                }
+            },
+        },
+    })
+    harness.ctx.mode = "rpc"
+
+    await harness.commandHandler("install-via-catalog", harness.ctx)
+
+    assert.equal(searches, 0)
+    assert.deepEqual(harness.customCalls, [])
+    assert.deepEqual(harness.notifications, [
+        {
+            message: "/package-manager install-via-catalog requires TUI mode.",
+            level: "warning",
+        },
+    ])
+})
+
+test("catalog install confirms the selected npm package before installing", async () => {
+    let installSource: string | undefined
+    const harness = createHarness({
+        customReturnValue: {
+            name: "pi-demo",
+            version: "1.0.0",
+            description: "Demo package",
+            publisher: "demo",
+            downloadPeriod: "weekly",
+            downloadCount: 12,
+            types: ["extension"],
+            links: {},
+            installSource: "npm:pi-demo",
+        },
+        confirmReturnValue: true,
+        deps: {
+            runNativeInstall: async (_pi, _ctx, source) => {
+                installSource = source
+                return createExecResult({ code: 0, stdout: "installed", stderr: "" })
+            },
+        },
+    })
+
+    await harness.commandHandler("install-via-catalog", harness.ctx)
+
+    assert.deepEqual(harness.customCalls, [{ overlay: true }])
+    assert.equal(installSource, "npm:pi-demo")
+    assert.equal(harness.confirmCalls.length, 1)
+    assert.match(harness.confirmCalls[0]!.title, /pi-demo@1\.0\.0/u)
+    assert.match(harness.confirmCalls[0]!.message ?? "", /npm:pi-demo/u)
+    assert.equal(harness.entries.length, 1)
+    assert.equal(harness.entries[0]?.type, REPORT_ENTRY_TYPE)
+    assert.deepEqual(harness.widgets.at(-1), {
+        key: "pi-package-manager",
+        content: undefined,
+    })
+})
+
+test("catalog install does not install after confirmation is declined", async () => {
+    let installs = 0
+    const harness = createHarness({
+        customReturnValue: {
+            name: "pi-demo",
+            version: "1.0.0",
+            description: "Demo package",
+            downloadPeriod: "weekly",
+            types: ["skill"],
+            links: {},
+            installSource: "npm:pi-demo",
+        },
+        confirmReturnValue: false,
+        deps: {
+            runNativeInstall: async () => {
+                installs += 1
+                return createExecResult({ code: 0, stdout: "", stderr: "" })
+            },
+        },
+    })
+
+    await harness.commandHandler("install-via-catalog", harness.ctx)
+
+    assert.equal(installs, 0)
+    assert.deepEqual(harness.entries, [])
+    assert.deepEqual(harness.widgets, [])
+})
+
+test("catalog install suppresses stale report and widget work after session replacement", async () => {
+    let resolveInstall: ((result: ExecResult) => void) | undefined
+    const harness = createHarness({
+        customReturnValue: {
+            name: "pi-demo",
+            version: "1.0.0",
+            description: "Demo package",
+            downloadPeriod: "weekly",
+            types: ["theme"],
+            links: {},
+            installSource: "npm:pi-demo",
+        },
+        confirmReturnValue: true,
+        deps: {
+            runNativeInstall: async () =>
+                new Promise((resolve) => {
+                    resolveInstall = resolve
+                }),
+        },
+    })
+
+    const pending = harness.commandHandler("install-via-catalog", harness.ctx)
+    for (let index = 0; index < 4; index += 1) {
+        await Promise.resolve()
+    }
+    await harness.replaceSession()
+    resolveInstall?.(createExecResult({ code: 0, stdout: "installed", stderr: "" }))
+    await pending
+
+    assert.deepEqual(harness.entries, [])
+    assert.ok(harness.widgets.length <= 1)
 })
 
 test("automatic startup update does not touch stale ctx after reload", async () => {
