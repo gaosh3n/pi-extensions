@@ -36,6 +36,7 @@ const SORT_OPTIONS: Array<{ value: CatalogSort; label: string }> = [
 ]
 
 type FocusTarget = "search" | "type" | "sort" | "results"
+type ExpandedTab = "type" | "sort"
 
 export async function promptForCatalogPackage(
     ctx: Pick<ExtensionCommandContext, "ui">,
@@ -67,7 +68,7 @@ export async function promptForCatalogPackage(
 class CatalogPicker implements Component {
     private readonly container = new Container()
     private readonly title = new Text("", 1, 0)
-    private readonly summary = new Text("", 1, 0)
+    private readonly tabs = new Text("", 1, 0)
     private readonly details = new Text("", 1, 0)
     private readonly status = new Text("", 1, 0)
     private readonly footer = new Text("", 1, 0)
@@ -83,6 +84,7 @@ class CatalogPicker implements Component {
     private allPackages: CatalogPackage[] = []
     private visiblePackages: CatalogPackage[] = []
     private focus: FocusTarget = "search"
+    private expandedTab: ExpandedTab | undefined
     private loading = true
     private errorMessage: string | undefined
     private stale = false
@@ -126,7 +128,14 @@ class CatalogPicker implements Component {
 
     handleInput(data: string): void {
         if (matchesKey(data, Key.escape)) {
-            this.cancel()
+            if (this.expandedTab !== undefined) {
+                this.expandedTab = undefined
+                this.rebuildContainer()
+                this.refreshText()
+                this.tui.requestRender()
+            } else {
+                this.cancel()
+            }
             return
         }
 
@@ -143,9 +152,19 @@ class CatalogPicker implements Component {
         if (this.focus === "search") {
             this.input.handleInput(data)
         } else if (this.focus === "type") {
-            this.typeList.handleInput(data)
+            if (this.expandedTab === "type") {
+                this.typeList.handleInput(data)
+            } else if (matchesKey(data, Key.enter)) {
+                this.expandedTab = "type"
+                this.rebuildContainer()
+            }
         } else if (this.focus === "sort") {
-            this.sortList.handleInput(data)
+            if (this.expandedTab === "sort") {
+                this.sortList.handleInput(data)
+            } else if (matchesKey(data, Key.enter)) {
+                this.expandedTab = "sort"
+                this.rebuildContainer()
+            }
         } else {
             this.resultList.handleInput(data)
         }
@@ -222,10 +241,13 @@ class CatalogPicker implements Component {
             new DynamicBorder((text: string) => this.theme.fg("accent", text)),
         )
         this.container.addChild(this.title)
-        this.container.addChild(this.summary)
+        this.container.addChild(this.tabs)
+        if (this.expandedTab === "type") {
+            this.container.addChild(this.typeList)
+        } else if (this.expandedTab === "sort") {
+            this.container.addChild(this.sortList)
+        }
         this.container.addChild(this.input)
-        this.container.addChild(this.typeList)
-        this.container.addChild(this.sortList)
         this.container.addChild(this.status)
         this.container.addChild(this.resultList)
         this.container.addChild(this.details)
@@ -239,6 +261,8 @@ class CatalogPicker implements Component {
         const targets: FocusTarget[] = ["search", "type", "sort", "results"]
         const index = targets.indexOf(this.focus)
         this.focus = targets[(index + delta + targets.length) % targets.length]!
+        this.expandedTab = undefined
+        this.rebuildContainer()
         this.refreshText()
         this.tui.requestRender()
     }
@@ -337,6 +361,17 @@ class CatalogPicker implements Component {
     private refreshText(): void {
         const type = TYPE_OPTIONS[this.typeListIndex()]?.label ?? "All types"
         const sort = SORT_OPTIONS[this.sortListIndex()]?.label ?? "Most downloads"
+        const typeLabel = this.expandedTab === "type" ? "Type" : `Type: ${type}`
+        const sortLabel = this.expandedTab === "sort" ? "Sort By" : `Sort By: ${sort}`
+        const typeTab =
+            this.focus === "type"
+                ? this.theme.fg("accent", typeLabel)
+                : this.theme.fg("dim", typeLabel)
+        const sortTab =
+            this.focus === "sort"
+                ? this.theme.fg("accent", sortLabel)
+                : this.theme.fg("dim", sortLabel)
+        this.tabs.setText(`${typeTab}    ${sortTab}`)
         const selected = this.resultList.getSelectedItem()
         const selectedPackage = selected
             ? this.visiblePackages.find((pkg) => pkg.name === selected.value)
@@ -344,12 +379,6 @@ class CatalogPicker implements Component {
 
         this.title.setText(
             this.theme.fg("accent", this.theme.bold("Install from Pi Catalog")),
-        )
-        this.summary.setText(
-            this.theme.fg(
-                "dim",
-                `Search: ${this.input.getValue() || "(all packages)"} • Type: ${type} • Sort: ${sort}`,
-            ),
         )
         const statusMessage = this.loading
             ? "Loading catalog…"
@@ -383,7 +412,7 @@ class CatalogPicker implements Component {
         this.footer.setText(
             this.theme.fg(
                 "dim",
-                "tab/shift-tab focus • enter search/select • ↑↓ navigate • esc cancel",
+                "tab/shift-tab focus • enter open/search/select • esc fold/cancel • ↑↓ navigate",
             ),
         )
     }
